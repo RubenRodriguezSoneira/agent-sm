@@ -1,0 +1,71 @@
+diff --git a/docs/re/status.md b/docs/re/status.md
+index b198e21..b36166a 100644
+--- a/docs/re/status.md
++++ b/docs/re/status.md
+@@ -87,7 +87,7 @@ Sleep, nightmare, napping and yawning share one byte. A status can be set only w
+ | Yawning | `0215E0C0` | `021AA2BC` = (2, 2) | `gYawnTurnRange` {2, 2} | yes |
+ | Napping | `02161370` | `021AA344` = (2, 4) | `gNappingTurnRange` {2, 4} | yes |
+ 
+-- The roll itself is `CalculateStatusTurns` (`0219CF28`), which rolls `DungeonRandRange` on a (min, max) pair. For a monster it also adjusts the roll: a check with argument `0x12` halves it, and a check with argument `0x14` caps it at 5 when it is above 4. The checks come from `021805B0`. `0x12` is an IQ skill bit and `0x14` is an ability. The roll gives `0x7F` for permanent and is never below 1 (blue-verified behaviour, #166 P2b). The name `CalculateStatusTurns` is red-hypothesis.
++- The roll itself is `CalculateStatusTurns` (`0219CF28`), which rolls `DungeonRandRange` on a (min, max) pair. For a monster it also adjusts the roll: a check with argument `0x12` halves it, and a check with argument `0x14` caps it at 5 when it is above 4. The checks come from `021805B0`. `021805B0` forwards a bit test on the monster info's IQ-skill bitfield, so `0x12` and `0x14` are both IQ-skill bits, not abilities (blue-verified static, #359; the `0x14` reading as an ability was loose). Whether `0219CF28` reads `0x14` through the same path was not re-read (lead). The roll gives `0x7F` for permanent and is never below 1 (blue-verified behaviour, #166 P2b). The name `CalculateStatusTurns` is red-hypothesis.
+ - **Yawn-end roll.** `0218FE64` case 4 rolls `021AA2C0` = (4, 8), then sleeps for roll + 1 turns. The value equals Red's nightmare range, but the source is not confirmed. Red's yawn end goes through `sub_80420B8` → `sub_804151C(0x19, 1)`, which is not a sleep-range call (low).
+ 
+ ### Sleep: countdown and per-turn
+@@ -692,13 +692,13 @@ Tag: **blue-verified** (decompile); **red-hypothesis** (the Red side, from the p
+ ## Open questions
+ 
+ - **Paralysis setter.** `021885A0` is the setter (#190 P4). Its match to Red's setter is not checked.
+-- **Yawning write.** One finding tags `0218ADA8` as writing `0x99 = 4` (blue-verified). Another lists yawning value 4 only as a red-hypothesis wake path. Confirm the write.
++- ~~**Yawning write.**~~ Closed (#359): `0218ADA8` writes `0x99 = 4` and `0x9A` as passed, see [First-dungeon statuses (#359)](#first-dungeon-statuses-359).
+ - **Sleepless (2).** Writer `0218AC74` (#190 P4). Other `(10, 12)` tables are not identified (see #190 P4, not verified).
+ - **Yawn-end range.** `0218FE64` case 4 uses `021AA2C0` (4, 8). Its source is unconfirmed. Check Red's `sub_804151C` path.
+-- **Yawning per-turn function.** `0213F6B0` is not identified.
+-- **Wake on hit.** `0217D5FC` and `0218F21C` disagree for nightmare and napping (P1.6). A trace at 127 turns is needed.
+-- **Countdown gate.** Why only the call from `0x02140BA4` decrements (#191 P1).
+-- **Ability and item IDs.** `FUN_021818D0`, `FUN_021805B0` (IQ and flag checks `0x11`, `0x12`, `0x14`), `FUN_02181904` (negative-status check): not named. Held item `0x14`, `0x15` and the IQ bit are matched by value only.
++- ~~**Yawning per-turn function.**~~ Narrowed (#359): `0213F6B0` is a thin forwarder to an indirect call with `(e, 0x19, 1)`, like `0213EA14`. Red's `sub_80420B8` matches (red-hypothesis). Whether the yawn step does more is open.
++- **Wake on hit.** Static reading done (#359): both routines act only on indefinite sleep (`0x9A == 0x7F`). Runtime check still needed.
++- **Countdown gate.** Not a gate inside `02185C70` (#359, blue-verified static): the four callers have their own guards. Which guard values pass in the trace is not read (lead).
++- **Ability and item IDs.** The three helpers are read (#359, below). Held item `0x14`, `0x15` and the IQ bit are matched by value only.
+ - **Calls with unknown arguments.** `0218DF38` (heal) argument order, `0217BCA4` (`…, 1, 0x208`) argument list, and `02190100` behaviour (inferred from its body).
+ - **Burn-end and burn-apply conditions** in `021760B4`: `0x2A & 3 == 2` and the dungeon flag `0x34AE`, unnamed. Callers of `0215C774` and `0214650C` are unknown.
+ - **Residual-damage reason tags** mapped in [#191 P3](#residual-damage-tags-191-p3).
+@@ -721,6 +721,38 @@ Tag: **blue-verified** (decompile); **red-hypothesis** (the Red side, from the p
+ - **Pool words** mapped to their HP-tier reader (#191 P2). The move that uses them is not identified.
+ - **Overlay addresses** of `gParalysisTurnRange` and `gSleeplessTurnRange` are `021AA304` and `021AA32C` (#190 P4, runtime values).
+ 
++## First-dungeon statuses (#359)
++
++Static pass over the export plus the move list in [`move-effects.md`](move-effects.md). **No runtime check was run in this pass**, so no duration here is newly runtime-verified, and the "Done when" is not met for statuses without an earlier runtime sample.
++
++**P1 list.** Statuses the 26 moves can cause: paralysis, burn, sleep, cringe, sure-shot class values 2 and 4, bide class `0xC`, leech seed. Stat stages are in the move handlers. Confusion, poison, nightmare, napping and yawning have no move in the list. The dungeon's traps were **not** read: the trap list and handlers are open (lead).
++
++| Status | Setter | Duration | Tag |
++|---|---|---|---|
++| Paralysis | `021885A0` | `0x9C` from the paralysis range, setter adds 1 | blue-verified static; no runtime sample |
++| Burn | `0218A710` | `0x7F` sentinel | blue-verified, runtime (#191 P1) |
++| Sleep | `0218B2D0` then `0218B420` | roll on `0219CF28` | blue-verified, runtime (#191 P1 / #190) |
++| Cringe | `021887E0`: `0xAC = 1`, `0xAD = roll + 1` | range word `DAT_02188904` not read | setter blue-verified static; duration lead |
++| Sure-shot 2 | `0218D778`: `0xC4 = 2`, `0xC5 = turns + 1`, turns passed by caller | caller rolls (1, 6) per move-effects | setter blue-verified static; effect of value 2 not read (lead) |
++| Sure-shot 4 | `0218D5F0`: `0xC4 = 4`, `0xC5 = roll + 1`, no Safeguard gate | roll inside the call | blue-verified static; reader is `CalcDamage` `0217BD94` |
++| Bide `0xC` | `0218E428` (#189 P1) | pool as in move-effects | blue-verified static |
++| Leech seed | `0218DAE4` (#166) | `0xC1 = roll + 1` | blue-verified static |
++
++Two rows of the move-effects table look wrong and are **lead**: Disable (`03B`) running the paralysis body, and Thunder Wave's `(1, 2)` draw being the paralysis turn roll rather than an accuracy draw.
++
++**Yawning write.** `0218ADA8(user, target, turns)` runs `CannotSleep` first. From `0x99 == 0` it writes `0x99 = 4` and `0x9A = turns`, then calls `0213F6C4` and `0217ADF8(target, 8)`. From other values it only shows a message. The wrapper `0215E0C0` passes `0219CF28(...) + 1`. blue-verified static.
++
++**Wake on hit.** `0217D5FC` calls the wake `0218F1EC` only for `0x99` in 1, 3, 5 **and** `0x9A == 0x7F`. `0218F21C` also handles petrified, then wakes only `0x99 == 1` with `0x9A == 0x7F`. So by static reading a hit does not wake a counted sleep (Hypnosis). blue-verified static; runtime check open.
++
++**Helpers (P4).** All blue-verified static; the names are leads.
++- `021818D0(e)`: true when `0x99` is 1, 3 or 5. Name: `IsSleeping`.
++- `02181904(e)`: 1 when any negative status is set (`0x99` in 1, 3, 4; `0x9B`; `0xA0` not 0 or 5; `0xAC`; `0xB3` 1 or 2; `0xB8` = 1; `0xC4` = 2; `0xC9` 1 or 2; `0xCB` = 1; `0xD2`; `0xDA`; move-slot flags; speed-down counters). Name: `HasNegativeStatus`.
++- `021805B0(e, bit)`: tests `1 << bit` against the IQ-skill bitfield of the monster info. Name: `HasIqSkill`.
++
++**P3 (RNG in the tick chain).** By the depth-2 walk and the setters read, the chain itself has no `DungeonRandInt` call except Shed Skin. The expiry routines can: yawn end rolls (4, 8); nightmare end; decoy end and `+0xC7` case 2 via `0217AF58`. Sleep, paralysis and cringe ends have none in the walk. blue-verified static; a runtime hook is open.
++
++**Still open for the Done-when:** runtime duration samples for paralysis, cringe, focus energy, smokescreen, leech seed and rage; per-turn effect and end condition reads for paralysis, cringe, value 2, rage and leech seed; the trap list.
++
+ ## Links
+ 
+ - Symbols: [symbols.md](../symbols.md)

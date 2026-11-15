@@ -1,0 +1,35 @@
+diff --git a/docs/re/status.md b/docs/re/status.md
+index b198e21..e1e9756 100644
+--- a/docs/re/status.md
++++ b/docs/re/status.md
+@@ -692,13 +692,13 @@ Tag: **blue-verified** (decompile); **red-hypothesis** (the Red side, from the p
+ ## Open questions
+ 
+ - **Paralysis setter.** `021885A0` is the setter (#190 P4). Its match to Red's setter is not checked.
+-- **Yawning write.** One finding tags `0218ADA8` as writing `0x99 = 4` (blue-verified). Another lists yawning value 4 only as a red-hypothesis wake path. Confirm the write.
++- **Yawning write (closed, #359 P2, static).** `0218ADA8` calls the sleep immunity gate `0218B140` and returns if blocked. If `+0x99` is 0 it writes `+0x99` = 4 and `+0x9A` = its third argument, with no `+1` (the sleep setters `0218AC74` and `0218B2D0` do add 1). Then it calls `0213F6C4` and `0217ADF8(8)`. With `+0x99` of 1, 3 or 5 it prints the already-asleep message; with 2, sleepless; with 4, already-yawning. [blue-verified, static; no runtime check yet]
+ - **Sleepless (2).** Writer `0218AC74` (#190 P4). Other `(10, 12)` tables are not identified (see #190 P4, not verified).
+ - **Yawn-end range.** `0218FE64` case 4 uses `021AA2C0` (4, 8). Its source is unconfirmed. Check Red's `sub_804151C` path.
+-- **Yawning per-turn function.** `0213F6B0` is not identified.
+-- **Wake on hit.** `0217D5FC` and `0218F21C` disagree for nightmare and napping (P1.6). A trace at 127 turns is needed.
+-- **Countdown gate.** Why only the call from `0x02140BA4` decrements (#191 P1).
+-- **Ability and item IDs.** `FUN_021818D0`, `FUN_021805B0` (IQ and flag checks `0x11`, `0x12`, `0x14`), `FUN_02181904` (negative-status check): not named. Held item `0x14`, `0x15` and the IQ bit are matched by value only.
++- **Yawning per-turn function (closed, #359 P2, static).** `0213F6B0` is a one-line trampoline through the pool pointer `DAT_0213F6C0`, called as `(entity, 0x19, 1)`; it is an effect or display call and changes no status. The yawn-to-sleep conversion is `0218FE64` case 4. [blue-verified, static]
++- **Wake on hit (static reading, #359 P2).** `0217D5FC` calls `0218F21C` (at `0217D648`) and `0218F1EC` (at `0217D790`). `0218F21C` runs the frozen-class end `0218FC18` when `+0xA0` is 6, and `0218FE64(…,0,1)` when `+0x99` is 1 and `+0x9A` is `0x7F`. `0218F1EC` is used for `+0x99` of 1, 3 or 5 with `+0x9A` = `0x7F`; it clears `+0x99` and `+0x9A`. So both act only on the permanent value `0x7F`, and a timed sleep is not woken by damage. [blue-verified, static; the runtime check (hit a slept target, read `+0x99` and `+0x9A`) is still open]
++- **Countdown gate (#359 P2, static; runtime open).** `TickStatusAndHealthRegen` (`02185C70`) has no gate on the call site. Its gates are: entity valid (`02142AE4`), floor not over (`0214067C` is 0), and per class `status != 0` and `0219BF1C` reaching 0. `0219BF1C` leaves `0x7F` alone. [blue-verified, static] **Lead:** the #191 observation likely means each call ticks a different entity and only the `02140BA4` call had the status bearer. Check by logging r0 at each call site.
++- **Ability and item IDs.** Helpers named (#359 P4): `021818D0` is `IsSleepLike` (`+0x99` of 1, 3 or 5), `021805B0` is `IqSkillIsEnabled` (tail call to `IsIQSkillSet` `02004250`), `02181904` is `HasAnyStatus`; see `combat.md` line 274 and `ai.md` P3b and P3c [blue-verified]. Held item `0x14`, `0x15` and the IQ bit are matched by value only.
+ - **Calls with unknown arguments.** `0218DF38` (heal) argument order, `0217BCA4` (`…, 1, 0x208`) argument list, and `02190100` behaviour (inferred from its body).
+ - **Burn-end and burn-apply conditions** in `021760B4`: `0x2A & 3 == 2` and the dungeon flag `0x34AE`, unnamed. Callers of `0215C774` and `0214650C` are unknown.
+ - **Residual-damage reason tags** mapped in [#191 P3](#residual-damage-tags-191-p3).
+diff --git a/docs/re/turns.md b/docs/re/turns.md
+index 06d5815..d847eb5 100644
+--- a/docs/re/turns.md
++++ b/docs/re/turns.md
+@@ -486,6 +486,6 @@ The full map is in [`structs.md`](structs.md).
+ - **P6.2, hunger damage.** Resolved: the Blue call is `FUN_0217BCA4(entity, 1, 0xE, 0x211)` (see the empty-belly paragraph under [Per-turn effects](#per-turn-effects)).
+ - **P6.4, callers of the weather resolver.** Resolved: 13 callers, classified in the table under Weather (#182 P2).
+ - **P6.5, wind phase 3.** Resolved: see the wind paragraph under [Per-turn effects](#per-turn-effects).
+-- **RNG in the status chain** of `TickStatusAndHealthRegen` (#51).
++- **RNG in the status chain** of `TickStatusAndHealthRegen` (#51). Static reading (#359 P3): the body makes no `DungeonRand*` call; HP regen (`021432E8`, `0218067C`, `02195C48`) shows none; RNG is reached only through the yawn end, nightmare damage and `0217AF58` (list under the chain table in `status.md`) [blue-verified, static]. Still open: a runtime count of RNG return addresses over many ticks, and `02154C28` (called first in the tick, not read).
+ - **`DisplayActions_Async` label.** Resolved (#182 P4): the label is confirmed, and the call order matches Red (see the DisplayActions paragraph under [Per-turn effects](#per-turn-effects)).
+ - **`DoEndOfTurnEffects` return value (closed, #353 P4).** Blue returns `bool`, the floor-over state, and no Blue caller uses it. Red returns `void`. See [Per-turn effects](#per-turn-effects).
