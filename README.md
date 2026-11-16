@@ -11,6 +11,7 @@ Exits: `ready`, `gave-up`, `errored`, `split`, `escalated`, `stopped`.
 
 ## Usage
 
+    go run .                                    # auto-configure and start the web UI
     go build
     agent-sm --config /trusted/go.json <repo-dir> <issue-number>
     agent-sm --config /trusted/go.json serve [--repo DIR] [issue] [addr]
@@ -32,6 +33,14 @@ The repo's working tree must be clean; the run creates the branch `sm/issue-<n>`
 `copilot` (or `claude`), `git` and `gh` on the PATH, authenticated independently of the desktop
 app, plus the target project's build/test tools. Checks must be configured; there is no
 implicit Cargo default. `stats` and `allow` do not require a project profile.
+
+With no arguments or config, `go run .` starts the web UI in the current Git repo. It detects Go
+projects and the bundled Inventory .NET sample, and prefers the installed Copilot CLI, then Claude.
+If the current directory is not a Git repo, enter a local repo path in the page. Unknown languages
+use a basic `git diff --check`; configure real build/test checks for meaningful verification.
+You can override the detected language profile and agent in the page. The .NET example targets a
+specific sample solution and is not universal. The page is loopback-only and token-protected, but
+choosing a repo gives the agent access to work in that repo, so only select repositories you trust.
 
 There is no resume: a run always starts at `prepare`. A stopped or failed run leaves its branch
 in place; delete it before running the issue again.

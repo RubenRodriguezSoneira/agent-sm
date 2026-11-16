@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -98,12 +99,85 @@ func TestQueuedProfile(t *testing.T) {
 		t.Fatal("queue mutated the server's profile")
 	}
 	for _, req := range []runRequest{
-		{Provider: "claude"}, {Audit: true}, {Budget: "0"}, {Budget: "NaN"},
+		{Audit: true}, {Budget: "0"}, {Budget: "NaN"},
 		{Models: map[string]string{"check": "model"}},
 	} {
 		if _, err := queuedProfile(req); err == nil {
 			t.Errorf("accepted invalid queued override %+v", req)
 		}
+	}
+	got, err = queuedProfile(runRequest{Provider: "claude"})
+	if err != nil || got.Provider != "claude" {
+		t.Fatalf("provider selection: %+v %v", got, err)
+	}
+}
+
+func TestQueuedLanguageProfile(t *testing.T) {
+	p := defaultProfile("copilot")
+	p.Checks = []string{"true"}
+	useProfile(t, p)
+	got, err := queuedProfile(runRequest{Language: "go", Provider: "claude"})
+	if err != nil || got.Provider != "claude" || len(got.Checks) != 3 || !strings.Contains(got.Checks[0], "gofmt") {
+		t.Fatalf("Go profile selection: %+v %v", got, err)
+	}
+	got, err = queuedProfile(runRequest{Language: "dotnet", Provider: "copilot"})
+	if err != nil || len(got.TestReports) != 1 || !strings.HasPrefix(got.Checks[0], "dotnet build") {
+		t.Fatalf(".NET profile selection: %+v %v", got, err)
+	}
+	if _, err := queuedProfile(runRequest{Language: "python"}); err == nil {
+		t.Fatal("accepted an unknown language profile")
+	}
+}
+
+func TestCanonicalRepo(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "init", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %s: %v", out, err)
+	}
+	subdir := filepath.Join(repo, "nested")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := canonicalRepo(subdir)
+	if err != nil || got != repo {
+		t.Fatalf("canonical repo = %q, %v; want %q", got, err, repo)
+	}
+	if _, err := canonicalRepo(filepath.Join(dir, "not-a-repo")); err == nil {
+		t.Fatal("accepted a non-repository path")
+	}
+}
+
+func TestRunScratchSeparatesRepositories(t *testing.T) {
+	t.Setenv("SM_SCRATCH_ROOT", t.TempDir())
+	a := runScratch("/work/first", 12)
+	b := runScratch("/work/second", 12)
+	if a == b || filepath.Base(a) != "12" || filepath.Base(b) != "12" {
+		t.Fatalf("repository scratch paths collided or lost issue id: %q, %q", a, b)
+	}
+}
+
+func TestAutoLanguageProfile(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "go.mod"), "module example\n", 0o644)
+	goProfile, err := autoLanguageProfile(dir)
+	if err != nil || len(goProfile.Checks) != 3 || !strings.Contains(goProfile.Checks[0], "gofmt") {
+		t.Fatalf("Go auto-detection: %+v %v", goProfile, err)
+	}
+
+	generic, err := autoLanguageProfile(t.TempDir())
+	if err != nil || len(generic.Checks) != 1 || generic.Checks[0] != "git diff --check" {
+		t.Fatalf("generic fallback: %+v %v", generic, err)
+	}
+
+	dotnetDir := t.TempDir()
+	writeFile(t, filepath.Join(dotnetDir, "Inventory.ChannelX.slnx"), "", 0o644)
+	dotnet, err := autoLanguageProfile(dotnetDir)
+	if err != nil || len(dotnet.TestReports) != 1 {
+		t.Fatalf(".NET auto-detection: %+v %v", dotnet, err)
 	}
 }
 

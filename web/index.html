@@ -169,6 +169,12 @@
 </div></header>
 
 <main>
+  <section class="panel runbar" aria-label="Run setup">
+    <label>Repository path <input class="field" id="repoPath" type="text" size="36" placeholder="/path/to/git/repository"></label>
+    <label>Language profile <select class="field" id="language"><option value="auto">Auto detect</option><option value="server">Server profile</option><option value="go">Go</option><option value="dotnet">.NET example (Inventory)</option></select></label>
+    <label>Agent <select class="field" id="agent"><option value="copilot">Copilot</option><option value="claude">Claude</option></select></label>
+    <button class="btn primary" id="selectRepo">Use setup</button>
+  </section>
   <section class="issues" id="issuesPanel">
     <div class="head">
       <h2>Open issues</h2><span class="count" id="issueCount"></span>
@@ -247,7 +253,10 @@
 </main>
 <script>
 const TOKEN = "__TOKEN__";
+const DEFAULT_REPO = __REPO__;
+const DEFAULT_AGENT = __AGENT__;
 let OLD = [], QERR = "", EDGES = [], ISSUES = [], QUEUE = {}, SEL = new Set(), CAN_RUN = false, BUSY = false, RUNNING = false, PICKED = null, TIMER;
+let SELECTED_REPO = "", SELECTED_LANGUAGE = "auto", SELECTED_AGENT = DEFAULT_AGENT;
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // put sets an element's HTML only when it changed, so scroll positions and focus survive a poll.
@@ -396,7 +405,9 @@ function renderIssues() {
   $("runBtn").textContent = OLD.length ? "Discard old work and run" : (n > 1 ? "Run " + n + " issues" : "Run");
 }
 async function loadIssues(refresh) {
-  const r = await fetch("/api/issues" + (refresh ? "?refresh=1" : ""));
+  const params = new URLSearchParams({ repo: SELECTED_REPO });
+  if (refresh) params.set("refresh", "1");
+  const r = await fetch("/api/issues?" + params);
   if (!r.ok) { $("msg").textContent = "Cannot list issues: " + await r.text(); return; }
   ISSUES = await r.json(); renderIssues();
 }
@@ -520,10 +531,11 @@ $("models").addEventListener("change", () => { try { localStorage.setItem("sm-mo
 
 function renderQueue(q) {
   const first = !QUEUE.provider;
+  const providerChanged = QUEUE.provider && QUEUE.provider !== q.provider;
   QUEUE = q; BUSY = !!q.running; renderModels(q.models);
   $("provider").textContent = q.provider || "";
   $("budgetUnit").textContent = q.usage_unit || "";
-  if (first) $("budget").value = q.session_limit;
+  if (first || providerChanged) $("budget").value = q.session_limit;
   $("audit").disabled = q.provider !== "claude";
   if ($("audit").disabled) $("audit").checked = false;
   const chips = [];
@@ -539,10 +551,33 @@ function renderQueue(q) {
   renderIssues();
 }
 async function pollQueue() {
-  const q = await (await fetch("/api/queue")).json();
+  if (!SELECTED_REPO) return;
+  const q = await (await fetch(selectionURL("/api/queue"))).json();
   if (q.can_run && !CAN_RUN) { CAN_RUN = true; $("issuesPanel").classList.add("on"); loadIssues(false); }
   if (q.can_run) renderQueue(q);
 }
+function selectionURL(path) {
+  const params = new URLSearchParams({ repo: SELECTED_REPO, language: SELECTED_LANGUAGE, provider: SELECTED_AGENT });
+  return path + "?" + params;
+}
+$("selectRepo").addEventListener("click", async () => {
+  SELECTED_REPO = $("repoPath").value.trim();
+  SELECTED_LANGUAGE = $("language").value;
+  SELECTED_AGENT = $("agent").value;
+  SEL.clear(); ISSUES = []; CAN_RUN = false;
+  $("issuesPanel").classList.remove("on");
+  $("models").innerHTML = "";
+  $("msg").textContent = "";
+  if (!SELECTED_REPO) { $("msg").textContent = "Enter a local Git repository path."; return; }
+  try {
+    const r = await fetch(selectionURL("/api/queue"));
+    if (!r.ok) throw new Error(await r.text());
+    const q = await r.json();
+    if (!q.can_run) throw new Error(q.error || "Repository is not available.");
+    CAN_RUN = true; $("issuesPanel").classList.add("on");
+    renderQueue(q); await loadIssues(true);
+  } catch (e) { $("msg").textContent = "Cannot use repository: " + e.message; }
+});
 $("filter").addEventListener("input", renderIssues);
 $("refresh").addEventListener("click", () => loadIssues(true));
 $("issueGrid").addEventListener("change", e => {
@@ -563,7 +598,7 @@ $("runBtn").addEventListener("click", async () => {
   $("msg").textContent = "";
   try {
     SEL.clear(); PICKED = null;
-    const body = { issues, publish, provider: QUEUE.provider, audit: $("audit").checked, budget: $("budget").value, discard: OLD.length > 0, models: chosenModels() };
+    const body = { issues, repo: SELECTED_REPO, language: SELECTED_LANGUAGE, publish, provider: SELECTED_AGENT, audit: $("audit").checked, budget: $("budget").value, discard: OLD.length > 0, models: chosenModels() };
     // 409: a sub-issue that would run has old work, which only the server can see.
     const q = await post("/api/run", body).catch(e => {
       if (e.status !== 409 || !confirm(e.message + "\n\nDiscard old work and run?")) throw e;
@@ -575,18 +610,22 @@ $("runBtn").addEventListener("click", async () => {
 });
 $("stopBtn").addEventListener("click", async () => {
   if (!confirm("Stop the running job and clear the queue?")) return;
-  try { renderQueue(await post("/api/stop")); } catch (e) { $("msg").textContent = "Cannot stop: " + e.message; }
+  try { renderQueue(await post(selectionURL("/api/stop"))); } catch (e) { $("msg").textContent = "Cannot stop: " + e.message; }
 });
 
 async function tick() {
   clearTimeout(TIMER);
   try {
     if (!EDGES.length) EDGES = await (await fetch("/api/graph")).json();
-    render(await (await fetch("/api/state")).json());
+    render(await (await fetch(SELECTED_REPO ? selectionURL("/api/state") : "/api/state")).json());
     await pollQueue();
   } catch (e) { $("line").textContent = "cannot reach the server: " + e; }
   TIMER = setTimeout(tick, RUNNING || BUSY ? 2000 : 10000); // nothing changes fast when no run is live
 }
+$("repoPath").value = DEFAULT_REPO;
+$("language").value = "auto";
+$("agent").value = DEFAULT_AGENT;
+if (DEFAULT_REPO) $("selectRepo").click();
 loadManagement();
 tick();
 </script>

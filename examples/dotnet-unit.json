@@ -1,8 +1,8 @@
 {
   "provider": "copilot",
   "checks": [
-    "dotnet build Inventory.ChannelX.slnx",
-    "dotnet test --project test/UnitTest/UnitTest.csproj --report-trx --results-directory \"$SM_CHECK_RESULTS/unit\""
+    "dotnet build .",
+    "dotnet test"
   ],
   "required_test_reports": ["unit/*.trx"],
   "commands": {

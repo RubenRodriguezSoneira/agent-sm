@@ -3,14 +3,16 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	_ "embed"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -21,6 +23,82 @@ import (
 
 //go:embed web/index.html
 var indexHTML []byte
+
+//go:embed examples/go.json examples/dotnet-unit.json
+var languageProfileFiles embed.FS
+
+func languageProfile(name string) (Profile, error) {
+	path := map[string]string{"go": "examples/go.json", "dotnet": "examples/dotnet-unit.json"}[name]
+	if path == "" {
+		return Profile{}, fmt.Errorf("unknown language profile %q", name)
+	}
+	data, err := languageProfileFiles.ReadFile(path)
+	if err != nil {
+		return Profile{}, err
+	}
+	p := defaultProfile("copilot")
+	if err := decodeStrict(data, &p); err != nil {
+		return Profile{}, fmt.Errorf("language profile %q: %w", name, err)
+	}
+	if err := p.validate(); err != nil {
+		return Profile{}, fmt.Errorf("language profile %q: %w", name, err)
+	}
+	return p, nil
+}
+
+func autoProvider() string {
+	if _, err := exec.LookPath("copilot"); err == nil {
+		return "copilot"
+	}
+	if _, err := exec.LookPath("claude"); err == nil {
+		return "claude"
+	}
+	return "copilot"
+}
+
+func autoLanguageProfile(repo string) (Profile, error) {
+	root := repo
+	if root == "" {
+		root = "."
+	}
+	canonical, err := filepath.Abs(root)
+	if err != nil {
+		return Profile{}, err
+	}
+	if _, err := os.Stat(filepath.Join(canonical, "go.mod")); err == nil {
+		return languageProfile("go")
+	}
+	if _, err := os.Stat(filepath.Join(canonical, "Inventory.ChannelX.slnx")); err == nil {
+		return languageProfile("dotnet")
+	}
+	p := defaultProfile("copilot")
+	p.Checks = []string{"git diff --check"}
+	return p, nil
+}
+
+func autoProfile(repo string) (Profile, error) {
+	p, err := autoLanguageProfile(repo)
+	if err != nil {
+		return Profile{}, err
+	}
+	p.Provider = autoProvider()
+	return p, nil
+}
+
+func canonicalRepo(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("repository path is required")
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	out, err := sh(absolute, "git", "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", fmt.Errorf("not a Git repository: %s", tail(out, 300))
+	}
+	return filepath.Abs(strings.TrimSpace(out))
+}
 
 // eventsPath is where logEvent also appends (set in main; SM_EVENTS overrides).
 var eventsPath string
@@ -63,22 +141,23 @@ func readLines(path string, keep int) []json.RawMessage {
 // latestRun is the newest run directory under root (by the mtime of its status.json or events.jsonl).
 func latestRun(root string) (dir, issue string) {
 	var best int64
-	dirs, _ := filepath.Glob(filepath.Join(root, "*"))
-	for _, d := range dirs {
-		for _, f := range []string{"status.json", "events.jsonl"} {
-			if fi, err := os.Stat(filepath.Join(d, f)); err == nil && fi.ModTime().UnixNano() > best {
-				best, dir, issue = fi.ModTime().UnixNano(), d, filepath.Base(d)
-			}
+	filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || (entry.Name() != "status.json" && entry.Name() != "events.jsonl") {
+			return nil
 		}
-	}
+		if fi, err := entry.Info(); err == nil && fi.ModTime().UnixNano() > best {
+			best, dir, issue = fi.ModTime().UnixNano(), filepath.Dir(path), filepath.Base(filepath.Dir(path))
+		}
+		return nil
+	})
 	return dir, issue
 }
 
 // serve shows a run live: GET / the page, /api/graph the transitions, /api/state the run so far.
 // It reads files only (status.json, events, stats), so it can also replay a finished run.
 // With no issue it follows the newest run under SM_SCRATCH_ROOT (default ~/.local/state/agent-sm).
-// With repo set it also lists the repo's open issues and starts runs from the page (localhost,
-// token-protected, one at a time).
+// The page can list issues and start runs from any selected local Git repository (localhost,
+// token-protected, one run at a time).
 func serve(issue, addr, repo string) error {
 	root := scratchRoot()
 	statsPath := os.Getenv("SM_STATS")
@@ -90,26 +169,72 @@ func serve(issue, addr, repo string) error {
 	rand.Read(tok)
 	token := hex.EncodeToString(tok)
 
-	var run *Runner
+	defaultRepo := ""
 	if repo != "" {
-		self, _ := os.Executable()
-		self = strings.TrimSuffix(self, " (deleted)") // a rebuild replaces the file under a running server; the path still points at the new binary
-		if v := os.Getenv("SM_SELF"); v != "" {       // test hook: a stand-in for the agent-sm binary
-			self = v
+		defaultRepo, _ = filepath.Abs(repo)
+	}
+	self, _ := os.Executable()
+	self = strings.TrimSuffix(self, " (deleted)") // a rebuild replaces the file under a running server; the path still points at the new binary
+	if v := os.Getenv("SM_SELF"); v != "" {       // test hook: a stand-in for the agent-sm binary
+		self = v
+	}
+	runners := map[string]*Runner{}
+	var runnersMu sync.Mutex
+	var executionGate sync.Mutex
+	runnerFor := func(path string) (*Runner, error) {
+		if path == "" {
+			path = defaultRepo
 		}
-		repo, _ = filepath.Abs(repo)
-		run = &Runner{repo: repo, self: self, stats: statsPath}
+		canonical, err := canonicalRepo(path)
+		if err != nil {
+			return nil, err
+		}
+		if settings.Management.Mode == "service" && canonical != defaultRepo {
+			return nil, fmt.Errorf("repository selection is unavailable with service management; use the configured repository")
+		}
+		runnersMu.Lock()
+		defer runnersMu.Unlock()
+		if r := runners[canonical]; r != nil {
+			return r, nil
+		}
+		r := &Runner{repo: canonical, self: self, stats: statsPath, gate: &executionGate}
+		runners[canonical] = r
+		return r, nil
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(strings.Replace(string(indexHTML), "__TOKEN__", token, 1)))
+		repoJSON, _ := json.Marshal(defaultRepo)
+		providerJSON, _ := json.Marshal(settings.Provider)
+		page := strings.Replace(string(indexHTML), "__TOKEN__", token, 1)
+		page = strings.Replace(page, "__REPO__", string(repoJSON), 1)
+		page = strings.Replace(page, "__AGENT__", string(providerJSON), 1)
+		w.Write([]byte(page))
 	})
 	mux.HandleFunc("/api/graph", func(w http.ResponseWriter, r *http.Request) { json.NewEncoder(w).Encode(edges()) })
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		scratch, iss := os.Getenv("SM_SCRATCH"), issue
-		if scratch == "" && issue != "" {
+		if scratch == "" && r.URL.Query().Get("repo") != "" {
+			repo, err := canonicalRepo(r.URL.Query().Get("repo"))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			repoScratch := filepath.Dir(runScratch(repo, 0))
+			scratch, iss = latestRun(repoScratch)
+			if scratch == "" {
+				scratch = repoScratch
+			}
+		} else if scratch == "" && issue != "" {
 			scratch = filepath.Join(root, issue)
+			if defaultRepo != "" {
+				if n, err := strconv.Atoi(issue); err == nil {
+					candidate := runScratch(defaultRepo, n)
+					if _, err := os.Stat(filepath.Join(candidate, "events.jsonl")); err == nil {
+						scratch = candidate
+					}
+				}
+			}
 		}
 		if scratch == "" {
 			scratch, iss = latestRun(root)
@@ -125,27 +250,42 @@ func serve(issue, addr, repo string) error {
 		json.NewEncoder(w).Encode(map[string]any{"issue": iss, "status": status, "events": readLines(events, 500)})
 	})
 
-	// Starting and stopping runs: only with --repo, and only with the page's token.
+	// Starting and stopping runs use a selected local repository and the page's token.
 	var (
-		issuesMu   sync.Mutex
-		issuesJSON string
-		issuesAt   time.Time
+		issuesMu    sync.Mutex
+		issuesCache = map[string]struct {
+			data string
+			at   time.Time
+		}{}
 	)
 	mux.HandleFunc("/api/queue", func(w http.ResponseWriter, r *http.Request) {
-		if run == nil {
+		path := r.URL.Query().Get("repo")
+		if path == "" && defaultRepo == "" {
 			json.NewEncoder(w).Encode(map[string]any{"can_run": false})
 			return
 		}
-		json.NewEncoder(w).Encode(run.Snapshot())
+		run, err := runnerFor(path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		profile, err := queuedProfile(runRequest{Repo: run.repo, Language: r.URL.Query().Get("language"), Provider: r.URL.Query().Get("provider")})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		json.NewEncoder(w).Encode(queueSnapshot(run, profile))
 	})
 	mux.HandleFunc("/api/issues", func(w http.ResponseWriter, r *http.Request) {
-		if run == nil {
-			http.Error(w, "start the server with --repo to list issues", http.StatusNotFound)
+		run, err := runnerFor(r.URL.Query().Get("repo"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		issuesMu.Lock()
 		defer issuesMu.Unlock()
-		if r.URL.Query().Get("refresh") != "" || time.Since(issuesAt) > 30*time.Second {
+		cached := issuesCache[run.repo]
+		if r.URL.Query().Get("refresh") != "" || time.Since(cached.at) > 30*time.Second {
 			// The REST list, not `gh issue list`: it carries the sub-issue and blocked-by counts.
 			out, err := sh(run.repo, "gh", "api", "repos/{owner}/{repo}/issues?state=open&per_page=100", "--jq",
 				`[.[] | select(.pull_request | not) | {number, title, updatedAt: .updated_at, labels: [.labels[] | {name, color}], subs: (.sub_issues_summary.total // 0), subsDone: (.sub_issues_summary.completed // 0), blocked: (.issue_dependencies_summary.blocked_by // 0)}]`)
@@ -153,13 +293,17 @@ func serve(issue, addr, repo string) error {
 				http.Error(w, "listing issues failed: "+tail(out, 300), http.StatusBadGateway)
 				return
 			}
-			issuesJSON, issuesAt = out, time.Now()
+			cached = struct {
+				data string
+				at   time.Time
+			}{data: out, at: time.Now()}
+			issuesCache[run.repo] = cached
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(issuesJSON))
+		w.Write([]byte(cached.data))
 	})
 	authed := func(w http.ResponseWriter, r *http.Request) bool {
-		if run == nil || r.Method != http.MethodPost || r.Header.Get("X-SM-Token") != token {
+		if r.Method != http.MethodPost || r.Header.Get("X-SM-Token") != token {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return false
 		}
@@ -168,9 +312,9 @@ func serve(issue, addr, repo string) error {
 	ctx, cancel := context.WithCancel(runCtx)
 	defer cancel()
 	var management *manager
-	if run != nil && settings.Management.Mode == "service" {
+	if defaultRepo != "" && settings.Management.Mode == "service" {
 		var err error
-		management, err = newManager(ctx, repo, settings)
+		management, err = newManager(ctx, defaultRepo, settings)
 		if err != nil {
 			return err
 		}
@@ -189,6 +333,12 @@ func serve(issue, addr, repo string) error {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
+		run, err := runnerFor(req.Repo)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.Repo = run.repo
 		profile, err := queuedProfile(req)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -208,7 +358,7 @@ func serve(issue, addr, repo string) error {
 			for _, i := range list {
 				if !seen[i] {
 					seen[i] = true
-					jobs = append(jobs, Job{Issue: i, Publish: req.Publish, Audit: req.Audit, Budget: req.Budget,
+					jobs = append(jobs, Job{Issue: i, Repo: run.repo, Publish: req.Publish, Audit: req.Audit, Budget: req.Budget,
 						Discard: req.Discard, Models: req.Models, Provider: profile.Provider, Profile: &profile})
 				}
 			}
@@ -219,14 +369,24 @@ func serve(issue, addr, repo string) error {
 			return
 		}
 		run.Enqueue(jobs)
-		snap := run.Snapshot()
+		snap := queueSnapshot(run, profile)
 		snap["notes"] = notes
 		json.NewEncoder(w).Encode(snap)
 	})
 	mux.HandleFunc("/api/stop", func(w http.ResponseWriter, r *http.Request) {
 		if authed(w, r) {
+			run, err := runnerFor(r.URL.Query().Get("repo"))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 			run.Stop()
-			json.NewEncoder(w).Encode(run.Snapshot())
+			profile, err := queuedProfile(runRequest{Repo: run.repo, Language: r.URL.Query().Get("language"), Provider: r.URL.Query().Get("provider")})
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			json.NewEncoder(w).Encode(queueSnapshot(run, profile))
 		}
 	})
 
@@ -250,10 +410,7 @@ func serve(issue, addr, repo string) error {
 	if issue == "" {
 		what = "the newest run under " + root
 	}
-	mode := "view only"
-	if run != nil {
-		mode = "can start runs in " + repo
-	}
+	mode := "can select local repos and start runs from the page"
 	fmt.Fprintf(os.Stderr, "agent-sm: http://%s  (showing %s; %s; stats %s)\n", addr, what, mode, statsPath)
 	server := &http.Server{Addr: addr, Handler: http.HandlerFunc(guard), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
@@ -268,6 +425,8 @@ func serve(issue, addr, repo string) error {
 
 type runRequest struct {
 	Issues   []int             `json:"issues"`
+	Repo     string            `json:"repo,omitempty"`
+	Language string            `json:"language,omitempty"`
 	Publish  string            `json:"publish"`
 	Audit    bool              `json:"audit"`
 	Budget   string            `json:"budget"`
@@ -276,32 +435,54 @@ type runRequest struct {
 	Provider string            `json:"provider"`
 }
 
+func queueSnapshot(r *Runner, p Profile) map[string]any {
+	snap := r.Snapshot()
+	snap["provider"], snap["models"] = p.Provider, agentModelsFor(p)
+	snap["session_limit"], snap["usage_unit"] = p.SessionLimit, p.unit()
+	return snap
+}
+
 func queuedProfile(req runRequest) (Profile, error) {
-	if req.Provider != "" && req.Provider != settings.Provider {
-		return Profile{}, fmt.Errorf("provider differs from server profile; restart with the intended profile")
+	p := settings
+	if req.Language == "auto" || (req.Language != "" && req.Language != "server") {
+		var language Profile
+		var err error
+		if req.Language == "auto" {
+			language, err = autoLanguageProfile(req.Repo)
+		} else {
+			language, err = languageProfile(req.Language)
+		}
+		if err != nil {
+			return Profile{}, err
+		}
+		p.Checks, p.TestReports, p.Format, p.Commands = language.Checks, language.TestReports, language.Format, language.Commands
+		p.Legacy = language.Legacy
 	}
-	b, err := json.Marshal(settings)
+	if req.Provider != "" {
+		p.Provider = req.Provider
+	}
+	b, err := json.Marshal(p)
 	if err != nil {
 		return Profile{}, err
 	}
-	var p Profile
-	if err := json.Unmarshal(b, &p); err != nil {
-		return p, err
+	var resolved Profile
+	if err := json.Unmarshal(b, &resolved); err != nil {
+		return resolved, err
 	}
-	if p.Models == nil {
-		p.Models = map[string]string{}
+	if resolved.Models == nil {
+		resolved.Models = map[string]string{}
 	}
-	p.Audit = req.Audit
+	resolved.Audit = req.Audit
 	if req.Budget != "" {
-		p.SessionLimit, err = strconv.ParseFloat(req.Budget, 64)
+		resolved.SessionLimit, err = strconv.ParseFloat(req.Budget, 64)
 		if err != nil {
-			return p, fmt.Errorf("invalid session limit")
+			return resolved, fmt.Errorf("invalid session limit")
 		}
 	}
 	for state, model := range req.Models {
-		p.Models[state] = model
+		resolved.Models[state] = model
 	}
-	return p, p.validate()
+	return resolved, resolved.validate()
 }
 
 // oldWork names the jobs whose issue still has a worktree from an earlier run, as "#1, #2".

@@ -1005,6 +1005,9 @@ func main() {
 			i--
 		}
 	}
+	if len(args) == 0 {
+		args = []string{"serve"}
+	}
 	os.Args = append(os.Args[:1], args...)
 	managementCommand = len(args) > 0 && (args[0] == "issues" || args[0] == "reconcile")
 	if len(os.Args) >= 2 && os.Args[1] == "stats" {
@@ -1025,6 +1028,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "allow suggestions use Claude syntax; use profile commands for Copilot")
 			os.Exit(2)
 		}
+	} else if configPath == "" && len(args) > 0 && args[0] == "serve" {
+		p, err := autoProfile(".")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		settings = p
 	} else {
 		p, err := loadProfile(configPath)
 		if err != nil {
@@ -1105,6 +1115,13 @@ func main() {
 				issue = args[i]
 			} else {
 				addr = args[i]
+			}
+		}
+		if repo == "" && configPath == "" {
+			var err error
+			repo, err = canonicalRepo(".")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "agent-sm: could not auto-select the current repository: %v\n", err)
 			}
 		}
 		fmt.Fprintln(os.Stderr, serve(issue, addr, repo))

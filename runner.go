@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,6 +20,7 @@ import (
 // Job is one issue to process, started from the web page.
 type Job struct {
 	Issue      int               `json:"issue"`
+	Repo       string            `json:"repo,omitempty"`
 	Publish    string            `json:"publish"` // "" (local only) or "pr"; merge is CLI-only
 	Audit      bool              `json:"audit"`
 	Budget     string            `json:"budget"`
@@ -37,6 +40,7 @@ type Job struct {
 // process group so Stop can end the whole run (claude, probes and all).
 type Runner struct {
 	repo, self, stats string
+	gate              *sync.Mutex
 	mu                sync.Mutex
 	queue             []Job
 	cur               *Job
@@ -52,10 +56,14 @@ var (
 
 // agentModels is each agent state's current default model, for the page's pickers.
 func agentModels() map[string]string {
+	return agentModelsFor(settings)
+}
+
+func agentModelsFor(profile Profile) map[string]string {
 	m := map[string]string{}
 	for _, st := range steps {
 		if st.Role != "" {
-			m[st.Name] = stepModel(st)
+			m[st.Name] = profile.model(st)
 		}
 	}
 	return m
@@ -85,7 +93,20 @@ func (r *Runner) loop() {
 		r.cur = &j
 		r.mu.Unlock()
 
-		r.runOne(&j)
+		if r.gate != nil {
+			r.gate.Lock()
+			r.mu.Lock()
+			stopped := r.stopping
+			r.mu.Unlock()
+			if stopped {
+				j.Exit = "stopped"
+			} else {
+				r.runOne(&j)
+			}
+			r.gate.Unlock()
+		} else {
+			r.runOne(&j)
+		}
 
 		r.mu.Lock()
 		r.history = append(r.history, j)
@@ -185,11 +206,16 @@ func childEnv(j *Job, stats string) []string {
 	}
 	p.Models = models
 	b, _ := json.Marshal(p)
-	env = append(env, "SM_RESOLVED_CONFIG="+string(b), "SM_WORKTREE_BASE="+j.Base)
+	scratch := runScratch(j.Repo, j.Issue)
+	env = append(env, "SM_RESOLVED_CONFIG="+string(b), "SM_WORKTREE_BASE="+j.Base,
+		"SM_SCRATCH="+scratch, "SM_EVENTS="+filepath.Join(scratch, "events.jsonl"))
 	return env
 }
 
 func (r *Runner) runOne(j *Job) {
+	if j.Repo == "" {
+		j.Repo = r.repo
+	}
 	p := settings
 	if j.Profile != nil {
 		p = *j.Profile
@@ -216,10 +242,18 @@ func (r *Runner) runOne(j *Job) {
 		return
 	}
 	r.set(func() { j.Worktree = wt })
-	scratch := filepath.Join(scratchRoot(), strconv.Itoa(j.Issue))
+	scratch := runScratch(r.repo, j.Issue)
 	if err := os.MkdirAll(scratch, 0o755); err != nil {
 		r.set(func() { j.Err = err.Error() })
 		return
+	}
+	eventsPath := filepath.Join(scratch, "events.jsonl")
+	if _, err := os.Stat(eventsPath); err == nil {
+		archive := filepath.Join(scratch, "events-"+time.Now().Format("20060102-150405")+".jsonl")
+		if err := os.Rename(eventsPath, archive); err != nil {
+			r.set(func() { j.Err = err.Error() })
+			return
+		}
 	}
 	logf, err := os.Create(filepath.Join(scratch, "run.log"))
 	if err != nil {
@@ -238,7 +272,7 @@ func (r *Runner) runOne(j *Job) {
 	r.set(func() { r.cmd = cmd })
 	cmd.Wait()
 	exit := "died" // no exit event: the process ended abnormally
-	for _, l := range readLines(filepath.Join(scratch, "events.jsonl"), 1<<20) {
+	for _, l := range readLines(eventsPath, 1<<20) {
 		var e struct {
 			Exit, Management string
 			ManagementError  string `json:"management_error"`
@@ -280,6 +314,11 @@ func (r *Runner) Stop() {
 	if r.cmd != nil && r.cmd.Process != nil {
 		syscall.Kill(-r.cmd.Process.Pid, syscall.SIGTERM)
 	}
+}
+
+func runScratch(repo string, issue int) string {
+	repoHash := sha256.Sum256([]byte(filepath.Clean(repo)))
+	return filepath.Join(scratchRoot(), "repos", hex.EncodeToString(repoHash[:8]), strconv.Itoa(issue))
 }
 
 func (r *Runner) Snapshot() map[string]any {
