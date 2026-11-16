@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,16 +17,20 @@ import (
 
 // Job is one issue to process, started from the web page.
 type Job struct {
-	Issue    int               `json:"issue"`
-	Publish  string            `json:"publish"` // "" (local only) or "pr"; merge is CLI-only
-	Audit    bool              `json:"audit"`
-	Budget   string            `json:"budget"`
-	Discard  bool              `json:"discard"`          // remove an earlier run's worktree and branch first
-	Models   map[string]string `json:"models,omitempty"` // state -> model chosen on the page
-	Started  string            `json:"started,omitempty"`
-	Worktree string            `json:"worktree,omitempty"`
-	Exit     string            `json:"exit,omitempty"`
-	Err      string            `json:"err,omitempty"`
+	Issue      int               `json:"issue"`
+	Publish    string            `json:"publish"` // "" (local only) or "pr"; merge is CLI-only
+	Audit      bool              `json:"audit"`
+	Budget     string            `json:"budget"`
+	Discard    bool              `json:"discard"`          // remove an earlier run's worktree and branch first
+	Models     map[string]string `json:"models,omitempty"` // state -> model chosen on the page
+	Started    string            `json:"started,omitempty"`
+	Worktree   string            `json:"worktree,omitempty"`
+	Exit       string            `json:"exit,omitempty"`
+	Err        string            `json:"err,omitempty"`
+	Provider   string            `json:"provider,omitempty"`
+	Base       string            `json:"base,omitempty"`
+	Profile    *Profile          `json:"-"`
+	Management string            `json:"management,omitempty"`
 }
 
 // Runner runs queued jobs one at a time, each as `agent-sm <worktree> <issue>` in its own
@@ -113,6 +119,10 @@ func (r *Runner) leftovers() []int {
 // worktree holds that run's result (its staged changes), so it is only removed, with its local
 // branch, when discard says so.
 func (r *Runner) worktree(n int, discard bool) (string, error) {
+	return r.worktreeAt(n, discard, baseBranch())
+}
+
+func (r *Runner) worktreeAt(n int, discard bool, base string) (string, error) {
 	dir := filepath.Join(r.worktreeRoot(), fmt.Sprintf("%d-sm", n))
 	if _, err := os.Stat(dir); err == nil {
 		if !discard {
@@ -125,8 +135,11 @@ func (r *Runner) worktree(n int, discard bool) (string, error) {
 	if discard {
 		sh(r.repo, "git", "branch", "-D", "sm/issue-"+strconv.Itoa(n)) // absent is fine
 	}
-	base := baseBranch()
-	sh(r.repo, "git", "fetch", "origin", strings.TrimPrefix(base, "origin/"))
+	if strings.HasPrefix(base, "origin/") {
+		if out, err := sh(r.repo, "git", "fetch", "--", "origin", strings.TrimPrefix(base, "origin/")); err != nil {
+			return "", fmt.Errorf("fetch base: %s", tail(out, 300))
+		}
+	}
 	if out, err := sh(r.repo, "git", "worktree", "add", "--detach", dir, base); err != nil {
 		return "", fmt.Errorf("git worktree add: %s", tail(out, 300))
 	}
@@ -139,7 +152,7 @@ func (r *Runner) worktree(n int, discard bool) (string, error) {
 }
 
 func childEnv(j *Job, stats string) []string {
-	skip := map[string]bool{"SM_SCRATCH": true, "SM_EVENTS": true, "SM_PUBLISH": true, "SM_AUDIT": true, "SM_BUDGET": true, "SM_STATS": true}
+	skip := map[string]bool{"SM_SCRATCH": true, "SM_EVENTS": true, "SM_PUBLISH": true, "SM_AUDIT": true, "SM_BUDGET": true, "SM_STATS": true, "SM_RESOLVED_CONFIG": true, "SM_WORKTREE_BASE": true}
 	var env []string
 	for _, e := range os.Environ() {
 		if k, _, _ := strings.Cut(e, "="); !skip[k] {
@@ -159,19 +172,60 @@ func childEnv(j *Job, stats string) []string {
 	for state, m := range j.Models { // appended last, so the page's choice wins over the server's environment
 		env = append(env, "SM_MODEL_"+strings.ToUpper(state)+"="+m)
 	}
+	p := settings
+	if j.Profile != nil {
+		p = *j.Profile
+	}
+	models := map[string]string{}
+	for state, m := range p.Models {
+		models[state] = m
+	}
+	for state, m := range j.Models {
+		models[state] = m
+	}
+	p.Models = models
+	b, _ := json.Marshal(p)
+	env = append(env, "SM_RESOLVED_CONFIG="+string(b), "SM_WORKTREE_BASE="+j.Base)
 	return env
 }
 
 func (r *Runner) runOne(j *Job) {
-	wt, err := r.worktree(j.Issue, j.Discard)
+	p := settings
+	if j.Profile != nil {
+		p = *j.Profile
+	}
+	out, err := sh(r.repo, "gh", "issue", "view", strconv.Itoa(j.Issue), "--json", "body")
+	var issue struct{ Body string }
+	if err != nil || json.Unmarshal([]byte(out), &issue) != nil {
+		r.set(func() { j.Err = "cannot read issue metadata before creating worktree" })
+		return
+	}
+	meta, err := issueMetadata(issue.Body)
+	if err != nil {
+		r.set(func() { j.Err = err.Error() })
+		return
+	}
+	base := p.Base
+	if meta.Base != "" {
+		base = meta.Base
+	}
+	r.set(func() { j.Base = base })
+	wt, err := r.worktreeAt(j.Issue, j.Discard, base)
 	if err != nil {
 		r.set(func() { j.Err = err.Error() })
 		return
 	}
 	r.set(func() { j.Worktree = wt })
 	scratch := filepath.Join(scratchRoot(), strconv.Itoa(j.Issue))
-	os.MkdirAll(scratch, 0o755)
-	logf, _ := os.Create(filepath.Join(scratch, "run.log"))
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		r.set(func() { j.Err = err.Error() })
+		return
+	}
+	logf, err := os.Create(filepath.Join(scratch, "run.log"))
+	if err != nil {
+		r.set(func() { j.Err = err.Error() })
+		return
+	}
 	defer logf.Close()
 	cmd := exec.Command(r.self, wt, strconv.Itoa(j.Issue))
 	cmd.Env = childEnv(j, r.stats)
@@ -185,9 +239,18 @@ func (r *Runner) runOne(j *Job) {
 	cmd.Wait()
 	exit := "died" // no exit event: the process ended abnormally
 	for _, l := range readLines(filepath.Join(scratch, "events.jsonl"), 1<<20) {
-		var e struct{ Exit string }
+		var e struct {
+			Exit, Management string
+			ManagementError  string `json:"management_error"`
+		}
 		if json_unmarshal(l, &e) && e.Exit != "" {
 			exit = e.Exit
+			r.set(func() {
+				j.Management = e.Management
+				if e.ManagementError != "" {
+					j.Err = "Synchronization incomplete: " + e.ManagementError
+				}
+			})
 		}
 	}
 	r.mu.Lock()
@@ -196,6 +259,17 @@ func (r *Runner) runOne(j *Job) {
 	}
 	j.Exit = exit
 	r.mu.Unlock()
+	if p.Management.Mode == "service" && exit != string(Ready) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		m, err := newManager(ctx, r.repo, p)
+		if err == nil {
+			err = m.deactivate(ctx, j.Issue, exit)
+		}
+		if err != nil {
+			r.set(func() { j.Err = "synchronization deactivation failed: " + err.Error() })
+		}
+	}
 }
 
 // Stop clears the queue and ends the running job's whole process group.
@@ -216,5 +290,7 @@ func (r *Runner) Snapshot() map[string]any {
 		c := *r.cur
 		cur = &c
 	}
-	return map[string]any{"can_run": true, "repo": r.repo, "leftover": r.leftovers(), "models": agentModels(), "running": cur, "queued": append([]Job{}, r.queue...), "history": append([]Job{}, r.history...)}
+	return map[string]any{"can_run": true, "repo": r.repo, "leftover": r.leftovers(), "provider": settings.Provider,
+		"models": agentModels(), "session_limit": settings.SessionLimit, "usage_unit": settings.unit(),
+		"running": cur, "queued": append([]Job{}, r.queue...), "history": append([]Job{}, r.history...)}
 }

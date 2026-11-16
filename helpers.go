@@ -1,8 +1,6 @@
 package main
 
 import (
-	"encoding/json"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -16,7 +14,7 @@ var (
 	heredocRe = regexp.MustCompile(`<<-?\s*['"]?(\w+)['"]?`)
 	quotedRe  = regexp.MustCompile(`'[^']*'|"[^"]*"`)
 	shKeyword = map[string]bool{"for": true, "do": true, "done": true, "if": true, "then": true, "fi": true, "else": true, "while": true, "case": true, "esac": true}
-	twoWord   = map[string]bool{"git": true, "gh": true, "cargo": true, "rtk": true, "ghidra": true}
+	twoWord   = map[string]bool{"git": true, "gh": true, "cargo": true, "rtk": true, "ghidra": true, "dotnet": true, "go": true}
 )
 
 // stripHeredocs drops each heredoc body: the lines after a "<<WORD" marker up to the line holding WORD.
@@ -82,14 +80,14 @@ var outward = []string{"git push", "git commit", "git checkout", "git switch", "
 var auditDeny = func() string {
 	var l []string
 	for _, o := range outward {
-		l = append(l, "Bash("+o+":*)", "Bash(rtk "+o+":*)") // the RTK hook may prefix commands
+		l = append(l, "Bash("+o+":*)", "Bash(rtk "+o+":*)", "Bash(rtk proxy "+o+":*)")
 	}
 	return strings.Join(l, ",")
 }()
 
 // neverSuggest: a command key that must not be proposed for an allow list.
 func neverSuggest(key string) bool {
-	k := strings.TrimPrefix(key, "rtk ")
+	k := strings.TrimPrefix(strings.TrimPrefix(key, "rtk "), "proxy ")
 	if k == "rm" || k == "sudo" || k == "rtk" {
 		return true
 	}
@@ -99,20 +97,6 @@ func neverSuggest(key string) bool {
 		}
 	}
 	return false
-}
-
-// allowFor returns the per-state allow list from SM_ALLOW_FILE (JSON {"state": "tools"}) if it
-// names this state, else def.
-func allowFor(s State, def string) string {
-	b, err := os.ReadFile(os.Getenv("SM_ALLOW_FILE"))
-	if err != nil {
-		return def
-	}
-	var m map[string]string
-	if json.Unmarshal(b, &m) == nil && m[s.String()] != "" {
-		return m[s.String()]
-	}
-	return def
 }
 
 // withRTK adds, for every Bash(cmd:*) entry, the forms the RTK rule makes agents type:
@@ -129,10 +113,7 @@ func withRTK(allow string) string {
 
 // baseBranch is the branch runs start from and publish rebases onto (SM_BASE, default origin/main).
 func baseBranch() string {
-	if b := os.Getenv("SM_BASE"); b != "" {
-		return b
-	}
-	return "origin/main"
+	return settings.Base
 }
 
 // suggestAllow builds an allow list from what a state really used, plus a small floor.
