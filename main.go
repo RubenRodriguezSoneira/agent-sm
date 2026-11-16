@@ -11,6 +11,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -288,6 +289,7 @@ type Ctx struct {
 	RunBudget       float64 // native SM_RUN_LIMIT; 0 disables the run limit
 	Export          string  // prepare -> dispatch: whether the Ghidra export is usable, with its STAMP
 	Base            string
+	Branch          string
 	IssueURL        string
 	JiraKey         string
 	Proposal        *WorkPlan
@@ -390,7 +392,7 @@ func builtin(allow string) string {
 // allow is the tool allow list; only those built-in tools are loaded and no MCP servers,
 // skills or hooks, to keep the cached prefix small. It returns Ok, or why there is no result:
 // Invalid (missing or off-schema output), Timeout or OverBudget.
-func claudeAgent(c *Ctx, state State, prompt string, out any) (res Out) {
+func claudeAgent(c *Ctx, state State, prompt string, out any, transcript *agentTranscript) (res Out) {
 	step := steps[state]
 	ctx, cancel := context.WithTimeout(runCtx, time.Duration(settings.TimeoutMinutes*float64(time.Minute)))
 	defer cancel()
@@ -436,10 +438,19 @@ func claudeAgent(c *Ctx, state State, prompt string, out any) (res Out) {
 			args = append(args, "--add-dir", d)
 		}
 	}
+	if transcript != nil {
+		if err := transcript.request(args, state, cancel); err != nil {
+			logEvent(map[string]any{"event": "transcript-error", "err": err.Error()})
+			return Invalid
+		}
+	}
 	cmd := process(ctx, c.Repo, "claude", args...)
 	cmd.Env = cleanAgentEnv()
 	diagnostics := &boundedOutput{limit: 64 << 10}
 	cmd.Stderr = diagnostics
+	if transcript != nil {
+		cmd.Stderr = io.MultiWriter(transcript.stderr, diagnostics)
+	}
 	stdout, perr := cmd.StdoutPipe()
 	if perr == nil {
 		perr = cmd.Start()
@@ -458,7 +469,11 @@ func claudeAgent(c *Ctx, state State, prompt string, out any) (res Out) {
 	results := 0
 	usageReported := false
 	isErr, subtype := true, ""
-	sc := bufio.NewScanner(stdout)
+	var reader io.Reader = stdout
+	if transcript != nil {
+		reader = io.TeeReader(stdout, transcript.stdout)
+	}
+	sc := bufio.NewScanner(reader)
 	sc.Buffer(make([]byte, 1<<20), 64<<20)
 	for sc.Scan() {
 		line := sc.Bytes()
@@ -546,6 +561,9 @@ func claudeAgent(c *Ctx, state State, prompt string, out any) (res Out) {
 			st.CacheCreation, st.CacheRead = ev.RawUsage.Create, ev.RawUsage.Read
 		}
 	}
+	if sc.Err() != nil {
+		cancel()
+	}
 	runErr := cmd.Wait()
 	if err := sc.Err(); err != nil {
 		logEvent(map[string]any{"event": "agent-error", "err": err.Error()})
@@ -616,6 +634,12 @@ func prepare(c *Ctx) Out {
 		c.Base = meta.Base
 	}
 	c.JiraKey = meta.JiraKey
+	if c.Branch != "" {
+		if err := checkRunBranch(c); err != nil {
+			logEvent(map[string]any{"event": "prepare", "err": err.Error()})
+			return Fail
+		}
+	}
 	if settings.Jira.Mode == "actions" && c.JiraKey != "" {
 		result := reconcileJira(c)
 		logEvent(map[string]any{"event": "jira", "result": result})
@@ -635,6 +659,9 @@ func prepare(c *Ctx) Out {
 			logEvent(map[string]any{"event": "prepare", "err": err.Error()})
 			return Fail
 		}
+	} else if err := githubDependencies(c.Repo, c.Issue); err != nil {
+		logEvent(map[string]any{"event": "prepare", "err": err.Error()})
+		return Fail
 	}
 	for _, d := range dependencies(c.Body) {
 		if st, err := sh(c.Repo, "gh", "issue", "view", strconv.Itoa(d), "--json", "state", "--jq", ".state"); err != nil || strings.TrimSpace(st) != "CLOSED" {
@@ -642,27 +669,25 @@ func prepare(c *Ctx) Out {
 			return Fail
 		}
 	}
-	branch := "sm/issue-" + strconv.Itoa(c.Issue)
-	if n, _ := sh(c.Repo, "gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number", "--jq", "length"); strings.TrimSpace(n) != "0" && strings.TrimSpace(n) != "" {
-		logEvent(map[string]any{"event": "prepare", "err": "a PR from " + branch + " already exists; this is abort and restart, resolve it first"})
-		return Fail
-	}
-	_, localErr := sh(c.Repo, "git", "rev-parse", "--verify", "-q", "refs/heads/"+branch)
-	_, remoteErr := sh(c.Repo, "git", "ls-remote", "--exit-code", "--heads", "origin", branch)
-	if localErr == nil || remoteErr == nil {
-		logEvent(map[string]any{"event": "prepare", "err": "branch " + branch + " already exists (local or origin); delete it if it holds nothing you want"})
-		return Fail
-	}
-	if strings.HasPrefix(c.Base, "origin/") {
-		if out, err := sh(c.Repo, "git", "fetch", "--", "origin", strings.TrimPrefix(c.Base, "origin/")); err != nil {
-			logEvent(map[string]any{"event": "prepare", "err": "fetch base failed", "out": tail(out, 500)})
+	if c.Branch == "" {
+		branch, _, err := nextIssueBranch(c.Repo, c.Issue, "")
+		if err != nil {
+			logEvent(map[string]any{"event": "prepare", "err": err.Error()})
 			return Fail
 		}
+		if strings.HasPrefix(c.Base, "origin/") {
+			if out, err := sh(c.Repo, "git", "fetch", "--", "origin", strings.TrimPrefix(c.Base, "origin/")); err != nil {
+				logEvent(map[string]any{"event": "prepare", "err": "fetch base failed", "out": tail(out, 500)})
+				return Fail
+			}
+		}
+		if out, err := sh(c.Repo, "git", "checkout", "-b", branch, c.Base); err != nil {
+			logEvent(map[string]any{"event": "prepare", "err": "branch", "out": tail(out, 500)})
+			return Fail
+		}
+		c.Branch = branch
 	}
-	if out, err := sh(c.Repo, "git", "checkout", "-b", branch, c.Base); err != nil {
-		logEvent(map[string]any{"event": "prepare", "err": "branch", "out": tail(out, 500)})
-		return Fail
-	}
+	logEvent(map[string]any{"event": "branch", "branch": c.Branch, "base": c.Base})
 	if settings.Legacy {
 		c.Export = exportState()
 	}
@@ -1161,7 +1186,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "SM_PUBLISH must be empty, pr or merge")
 		os.Exit(2)
 	}
-	c := &Ctx{Repo: os.Args[1], Issue: n, Level: level, Ghidra: "none", Scratch: filepath.Join(scratchRoot(), strconv.Itoa(n)), RunBudget: settings.RunLimit, Base: os.Getenv("SM_WORKTREE_BASE")}
+	c := &Ctx{Repo: os.Args[1], Issue: n, Level: level, Ghidra: "none", Scratch: filepath.Join(scratchRoot(), strconv.Itoa(n)), RunBudget: settings.RunLimit, Base: os.Getenv("SM_WORKTREE_BASE"), Branch: os.Getenv("SM_WORKTREE_BRANCH")}
 	if v := os.Getenv("SM_GHIDRA_COPY"); settings.Legacy && v != "" {
 		c.Ghidra = v
 	}

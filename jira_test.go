@@ -16,11 +16,23 @@ func TestIssueMetadata(t *testing.T) {
 	if err != nil || got.JiraKey != "PUSH-42" || got.Base != "origin/feature/integration" {
 		t.Fatalf("%+v %v", got, err)
 	}
+	for _, line := range []string{
+		"- **Base branch**: `feature/integration` (parent Story #12).",
+		"- **Base branch**: `origin/feature/integration` (parent Story #12)",
+	} {
+		got, err := issueMetadata(line)
+		if err != nil || got.Base != "origin/feature/integration" {
+			t.Errorf("%q: %+v %v", line, got, err)
+		}
+	}
 	for _, invalid := range []string{
 		body + "- Jira issue: https://example.atlassian.net/browse/PUSH-43",
 		body + "- Base branch: main",
 		"Base branch: --upload-pack=bad",
 		"Base branch: feature/../main",
+		"Base branch: `--upload-pack=bad` (parent Story #12).",
+		"Base branch: `main` (or `release`)",
+		"Base branch: `main` (parent Story #12).\nBase branch: main",
 		"## Jira\nJira issue: not-a-url",
 		"Base branch: origin/--upload-pack",
 		"Base branch: main/.hidden",

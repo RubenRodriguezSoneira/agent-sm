@@ -33,19 +33,33 @@ type Profile struct {
 	ClaudeAllow    map[string]string   `json:"claude_allow,omitempty"`
 	ClaudeExtra    string              `json:"claude_extra_allow,omitempty"`
 	Audit          bool                `json:"audit,omitempty"`
+	Transcripts    bool                `json:"transcripts,omitempty"`
 }
 
 var settings = defaultProfile("copilot")
 var managementCommand bool
+
+const minCopilotCredits = 100
 
 func finiteNonnegative(n float64) bool {
 	return !math.IsNaN(n) && !math.IsInf(n, 0) && n >= 0
 }
 
 func defaultProfile(provider string) Profile {
-	p := Profile{Provider: provider, SessionLimit: 2, RunLimit: 20, TimeoutMinutes: 60, Base: "origin/main",
+	p := Profile{Provider: provider, SessionLimit: minCopilotCredits, RunLimit: 500, TimeoutMinutes: 60, Base: "origin/main",
 		Models: map[string]string{}, Commands: map[string][]string{}}
+	if provider == "claude" {
+		p.SessionLimit, p.RunLimit = 2, 20
+	}
 	return p
+}
+
+// Changing providers must not reinterpret a credit limit as dollars or vice versa.
+func (p *Profile) selectProvider(provider string) {
+	if p.Provider != provider {
+		defaults := defaultProfile(provider)
+		p.Provider, p.SessionLimit, p.RunLimit = provider, defaults.SessionLimit, defaults.RunLimit
+	}
 }
 
 func decodeStrict(b []byte, out any) error {
@@ -67,10 +81,61 @@ func decodeStrict(b []byte, out any) error {
 	return nil
 }
 
+func decodeProfile(b []byte, provider string) (Profile, error) {
+	var header struct {
+		Provider string `json:"provider"`
+	}
+	if err := json.Unmarshal(b, &header); err != nil {
+		return Profile{}, err
+	}
+	if provider == "" {
+		provider = header.Provider
+	}
+	if provider == "" {
+		provider = "copilot"
+	}
+	p := defaultProfile(provider)
+	err := decodeStrict(b, &p)
+	return p, err
+}
+
+func (p *Profile) applyLimitEnv() error {
+	for _, entry := range []struct {
+		name string
+		dst  *float64
+	}{{"SM_SESSION_LIMIT", &p.SessionLimit}, {"SM_RUN_LIMIT", &p.RunLimit}} {
+		if v, ok := os.LookupEnv(entry.name); ok {
+			n, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return fmt.Errorf("%s must be numeric", entry.name)
+			}
+			*entry.dst = n
+		}
+	}
+	for _, entry := range []struct {
+		name string
+		dst  *float64
+	}{{"SM_BUDGET", &p.SessionLimit}, {"SM_RUN_BUDGET", &p.RunLimit}} {
+		if v, ok := os.LookupEnv(entry.name); ok {
+			if p.Provider != "claude" {
+				return fmt.Errorf("%s is in dollars; use SM_SESSION_LIMIT/SM_RUN_LIMIT for Copilot credits", entry.name)
+			}
+			n, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return fmt.Errorf("%s must be numeric", entry.name)
+			}
+			*entry.dst = n
+		}
+	}
+	return nil
+}
+
 func loadProfile(path string) (Profile, error) {
 	p := defaultProfile("copilot")
 	if snapshot := os.Getenv("SM_RESOLVED_CONFIG"); snapshot != "" {
-		if err := decodeStrict([]byte(snapshot), &p); err != nil {
+		var err error
+		p, err = decodeProfile([]byte(snapshot), "")
+		if err != nil {
 			return p, fmt.Errorf("resolved configuration: %w", err)
 		}
 		return p, p.validateFor(managementCommand)
@@ -80,7 +145,8 @@ func loadProfile(path string) (Profile, error) {
 		if err != nil {
 			return p, err
 		}
-		if err := decodeStrict(b, &p); err != nil {
+		p, err = decodeProfile(b, os.Getenv("SM_PROVIDER"))
+		if err != nil {
 			return p, fmt.Errorf("profile: %w", err)
 		}
 		abs, err := filepath.Abs(path)
@@ -93,36 +159,24 @@ func loadProfile(path string) (Profile, error) {
 		if p.NotesDir != "" {
 			p.NotesDir = profilePath(filepath.Dir(abs), p.NotesDir)
 		}
+	} else if v := os.Getenv("SM_PROVIDER"); v != "" {
+		p = defaultProfile(v)
 	}
 	if v := os.Getenv("SM_PROVIDER"); v != "" {
 		p.Provider = v
 	}
-	for _, entry := range []struct {
-		name string
-		dst  *float64
-	}{{"SM_TIMEOUT", &p.TimeoutMinutes}, {"SM_SESSION_LIMIT", &p.SessionLimit}, {"SM_RUN_LIMIT", &p.RunLimit}} {
-		if v, ok := os.LookupEnv(entry.name); ok {
-			n, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return p, fmt.Errorf("%s must be numeric", entry.name)
-			}
-			*entry.dst = n
+	if v, ok := os.LookupEnv("SM_TIMEOUT"); ok {
+		n, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return p, fmt.Errorf("SM_TIMEOUT must be numeric")
 		}
+		p.TimeoutMinutes = n
 	}
-	for _, entry := range []struct {
-		name string
-		dst  *float64
-	}{{"SM_BUDGET", &p.SessionLimit}, {"SM_RUN_BUDGET", &p.RunLimit}} {
-		if v, ok := os.LookupEnv(entry.name); ok {
-			if p.Provider != "claude" {
-				return p, fmt.Errorf("%s is in dollars; use SM_SESSION_LIMIT/SM_RUN_LIMIT for Copilot credits", entry.name)
-			}
-			n, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				return p, fmt.Errorf("%s must be numeric", entry.name)
-			}
-			*entry.dst = n
-		}
+	if err := p.applyLimitEnv(); err != nil {
+		return p, err
+	}
+	if err := p.applyTranscriptEnv(); err != nil {
+		return p, err
 	}
 	if v, ok := os.LookupEnv("SM_CHECKS"); ok {
 		p.Checks = strings.Split(v, "\n")
@@ -194,6 +248,17 @@ func loadProfile(path string) (Profile, error) {
 	return p, p.validateFor(managementCommand)
 }
 
+func (p *Profile) applyTranscriptEnv() error {
+	if v, ok := os.LookupEnv("SM_TRANSCRIPTS"); ok {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("SM_TRANSCRIPTS must be a boolean")
+		}
+		p.Transcripts = enabled
+	}
+	return nil
+}
+
 func profilePath(base, p string) string {
 	if filepath.IsAbs(p) {
 		return p
@@ -236,6 +301,14 @@ func (p Profile) validateFor(managementOnly bool) error {
 	}
 	if p.SessionLimit == 0 || p.TimeoutMinutes == 0 {
 		return fmt.Errorf("session_limit and timeout_minutes must be positive")
+	}
+	if p.Provider == "copilot" {
+		if p.SessionLimit < minCopilotCredits {
+			return fmt.Errorf("Copilot session_limit must be at least %d AI credits", minCopilotCredits)
+		}
+		if p.RunLimit > 0 && p.RunLimit < minCopilotCredits {
+			return fmt.Errorf("Copilot run_limit must be 0 (unlimited) or at least %d AI credits", minCopilotCredits)
+		}
 	}
 	if p.TimeoutMinutes > float64(1<<63-1)/float64(time.Minute) {
 		return fmt.Errorf("timeout_minutes exceeds the supported duration")

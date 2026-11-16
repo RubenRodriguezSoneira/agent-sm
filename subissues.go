@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 )
@@ -57,11 +58,18 @@ func pickSubIssues(parent int, subs []subIssue, isOpen func(int) bool) (run []in
 
 // expand asks GitHub for an issue's sub-issues and applies pickSubIssues.
 func expand(repo string, n int) ([]int, []string) {
-	out, err := sh(repo, "gh", "api", fmt.Sprintf("repos/{owner}/{repo}/issues/%d/sub_issues?per_page=100", n), "--paginate", "--slurp", "--jq",
-		`[.[][] | {number, state, body: (.body // ""), blocked: (.issue_dependencies_summary.blocked_by // 0), subs: (.sub_issues_summary.total // 0)}]`)
-	var subs []subIssue
-	if err != nil || json.Unmarshal([]byte(out), &subs) != nil {
-		return nil, []string{fmt.Sprintf("#%d not queued: cannot read its sub-issues: %s", n, tail(strings.TrimSpace(out), 200))}
+	out, err := sh(repo, "gh", "api", fmt.Sprintf("repos/{owner}/{repo}/issues/%d/sub_issues?per_page=100", n), "--paginate", "--jq",
+		`[.[] | {number, state, body: (.body // ""), blocked: (.issue_dependencies_summary.blocked_by // 0), subs: (.sub_issues_summary.total // 0)}]`)
+	if err != nil {
+		detail, _, _ := strings.Cut(strings.TrimSpace(out), "\n\n")
+		if detail == "" {
+			detail = err.Error()
+		}
+		return nil, []string{fmt.Sprintf("#%d not queued: cannot read its sub-issues: %s", n, tail(detail, 200))}
+	}
+	subs, err := decodeGitHubPages[subIssue](out)
+	if err != nil {
+		return nil, []string{fmt.Sprintf("#%d not queued: cannot read its sub-issues: %v", n, err)}
 	}
 	if settings.Management.Mode == "service" {
 		if len(subs) == 0 {
@@ -95,6 +103,46 @@ func expand(repo string, n int) ([]int, []string) {
 		st, err := sh(repo, "gh", "issue", "view", strconv.Itoa(d), "--json", "state", "--jq", ".state")
 		return err != nil || strings.TrimSpace(st) != "CLOSED"
 	})
+}
+
+func decodeGitHubPages[T any](out string) ([]T, error) {
+	var values []T
+	decoder := json.NewDecoder(strings.NewReader(out))
+	for pageNumber := 0; ; pageNumber++ {
+		var page []T
+		err := decoder.Decode(&page)
+		if err == io.EOF && pageNumber > 0 {
+			break
+		}
+		if err != nil || page == nil {
+			if err == nil {
+				err = fmt.Errorf("expected a JSON array")
+			}
+			return nil, err
+		}
+		values = append(values, page...)
+	}
+	return values, nil
+}
+
+func githubDependencies(repo string, n int) error {
+	out, err := sh(repo, "gh", "api", fmt.Sprintf("repos/{owner}/{repo}/issues/%d/dependencies/blocked_by?per_page=100", n), "--paginate")
+	if err != nil {
+		return fmt.Errorf("cannot read GitHub blockers: %w: %s", err, tail(out, 300))
+	}
+	blockers, err := decodeGitHubPages[subIssue](out)
+	if err != nil {
+		return fmt.Errorf("invalid GitHub blockers: %w", err)
+	}
+	for _, blocker := range blockers {
+		if blocker.Number <= 0 || (blocker.State != "open" && blocker.State != "closed") {
+			return fmt.Errorf("invalid GitHub blocker identity or state")
+		}
+		if blocker.State == "open" {
+			return fmt.Errorf("blocked by open GitHub dependency #%d", blocker.Number)
+		}
+	}
+	return nil
 }
 
 func managedDependencies(ctx context.Context, repo string, n int) error {

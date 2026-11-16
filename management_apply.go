@@ -561,6 +561,7 @@ func (m *manager) ensureJira(ctx context.Context, p *Preview, i WorkItem, gh *is
 func githubBody(body, jiraURL, base, marker string) string {
 	var lines []string
 	inJira, inserted := false, false
+	baseIndex, annotatedBase := -1, ""
 	metadata := []string{"- **Jira issue**: " + jiraURL, "- **Base branch**: `" + base + "`"}
 	for _, line := range strings.Split(body, "\n") {
 		clean := strings.TrimSpace(line)
@@ -572,12 +573,22 @@ func githubBody(body, jiraURL, base, marker string) string {
 			if inJira && !inserted {
 				lines = append(lines, line)
 				lines = append(lines, metadata...)
+				baseIndex = len(lines) - 1
 				inserted = true
 				continue
 			}
 		}
-		key, _, _ := strings.Cut(strings.ToLower(strings.ReplaceAll(strings.TrimLeft(clean, "- "), "**", "")), ":")
-		if key == "base branch" || (inJira && key == "jira issue") {
+		key, value, _ := strings.Cut(strings.ReplaceAll(strings.TrimLeft(clean, "- "), "**", ""), ":")
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "base branch" {
+			if baseNote.MatchString(strings.TrimSpace(value)) {
+				prefix, rest, _ := strings.Cut(line, "`")
+				_, suffix, _ := strings.Cut(rest, "`")
+				annotatedBase = prefix + "`" + base + "`" + suffix
+			}
+			continue
+		}
+		if inJira && key == "jira issue" {
 			continue
 		}
 		lines = append(lines, line)
@@ -585,6 +596,10 @@ func githubBody(body, jiraURL, base, marker string) string {
 	if !inserted {
 		lines = append(lines, "", "## Jira")
 		lines = append(lines, metadata...)
+		baseIndex = len(lines) - 1
+	}
+	if annotatedBase != "" {
+		lines[baseIndex] = annotatedBase
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n")) + "\n\n<!-- " + marker + " -->"
 }

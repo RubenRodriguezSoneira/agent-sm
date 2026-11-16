@@ -61,6 +61,13 @@
   .btn.primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.08); }
   .btn.danger { color: var(--bad); }
   .btn:disabled { opacity: .45; cursor: default; }
+  .folder-picker { width: min(680px, calc(100% - 32px)); max-height: 85vh; padding: 20px; color: var(--ink); }
+  .folder-picker::backdrop { background: rgba(0, 0, 0, .4); }
+  .folder-picker label { display: flex; flex-direction: column; gap: 4px; }
+  .folder-picker ul { list-style: none; padding: 0; max-height: 40vh; overflow: auto; }
+  .folder-picker li + li { margin-top: 6px; }
+  .folder-picker li button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+  #folderStatus { overflow-wrap: anywhere; }
 
   /* issues */
   .issues { display: none; } .issues.on { display: block; }
@@ -171,10 +178,25 @@
 <main>
   <section class="panel runbar" aria-label="Run setup">
     <label>Repository path <input class="field" id="repoPath" type="text" size="36" placeholder="/path/to/git/repository"></label>
+    <button class="btn" id="browseRepo" type="button">Browse folders</button>
     <label>Language profile <select class="field" id="language"><option value="auto">Auto detect</option><option value="server">Server profile</option><option value="go">Go</option><option value="dotnet">.NET example (Inventory)</option></select></label>
     <label>Agent <select class="field" id="agent"><option value="copilot">Copilot</option><option value="claude">Claude</option></select></label>
     <button class="btn primary" id="selectRepo">Use setup</button>
   </section>
+  <div id="msg" role="alert"></div>
+  <dialog class="panel folder-picker" id="folderPicker" aria-labelledby="folderTitle">
+    <div class="head"><h2 id="folderTitle">Choose a repository folder</h2><button class="btn" id="folderCancel" type="button">Cancel</button></div>
+    <p class="mute">Folders on the computer running agent-sm. Select a Git working tree; nothing is uploaded.</p>
+    <form class="head" id="folderForm">
+      <label class="grow">Folder path <input class="field" id="folderPath" type="text" autocomplete="off"></label>
+      <button class="btn" type="submit">Go</button>
+      <button class="btn" id="folderHome" type="button">Home</button>
+      <button class="btn" id="folderUp" type="button" disabled>Up</button>
+    </form>
+    <p id="folderStatus" role="status"></p>
+    <ul id="folderList" aria-label="Subfolders"></ul>
+    <button class="btn primary" id="folderUse" type="button" disabled>Use this repository</button>
+  </dialog>
   <section class="issues" id="issuesPanel">
     <div class="head">
       <h2>Open issues</h2><span class="count" id="issueCount"></span>
@@ -187,14 +209,15 @@
       <span class="grow"></span>
       <label>Publish <select class="field" id="publish"><option value="">local branch only</option><option value="pr">open a draft PR</option></select></label>
       <span id="provider"></span>
-      <label>Limit per step <span id="budgetUnit"></span> <input class="field" type="number" id="budget" value="2" min="0.01" step="0.01"></label>
-      <label><input type="checkbox" id="audit"> audit mode</label>
+      <label>Limit per step <span id="budgetUnit"></span> <input class="field" type="number" id="budget" value="2" min="0.01" step="0.01" required></label>
+      <span class="mute" id="runBudget"></span>
+      <label title="Save prompts, responses and available tool messages locally. May contain sensitive code or output."><input type="checkbox" id="transcripts"> Save transcripts</label>
+      <label title="Claude only: bypass permission approvals to measure tool use. Not transcript logging."><input type="checkbox" id="audit"> permission audit</label>
       <button class="btn danger" id="stopBtn" disabled>Stop</button>
       <button class="btn primary" id="runBtn" disabled>Run</button>
     </div>
     <div class="panel runbar" id="modelBar"><b>Models</b><span class="mute" style="font-size:12px">per step, for the runs you start next</span><span class="grow"></span><span id="models" style="display:contents"></span></div>
     <div class="queue" id="qstate"></div>
-    <div id="msg" role="alert"></div>
   </section>
 
   <section aria-labelledby="managementHeading">
@@ -392,7 +415,7 @@ function renderIssues() {
     const s = state[i.number], busy = s && (s[0] === "running" || s[0] === "queued");
     return `<label class="icard${busy ? " busy" : ""}">
       <input type="checkbox" data-n="${i.number}" ${SEL.has(i.number) ? "checked" : ""} ${busy ? "disabled" : ""}>
-      <span class="i-top"><span class="i-num">#${i.number}</span><span>${i.updatedAt ? age(i.updatedAt) : ""}</span>${s ? `<span class="chip ${s[1]}">${esc(s[0])}</span>` : ""}${left.has(i.number) && !busy ? `<span class="chip warn" title="A worktree from an earlier run still holds its staged changes. Running this issue again discards them.">old work</span>` : ""}${i.blocked ? `<span class="chip warn" title="GitHub lists ${i.blocked} open issue(s) as blocking this one">blocked</span>` : ""}<span class="check"></span></span>
+      <span class="i-top"><span class="i-num">#${i.number}</span><span>${i.updatedAt ? age(i.updatedAt) : ""}</span>${s ? `<span class="chip ${s[1]}">${esc(s[0])}</span>` : ""}${left.has(i.number) && !busy ? `<span class="chip warn" title="Earlier work is kept. A new run uses a numbered branch and worktree from the issue's base.">old work kept</span>` : ""}${i.blocked ? `<span class="chip warn" title="GitHub lists ${i.blocked} open issue(s) as blocking this one">blocked</span>` : ""}<span class="check"></span></span>
       <span class="i-title">${esc(i.title)}</span>
       ${i.subs ? `<span class="i-subs" title="Selecting this issue runs its open sub-issues, not the issue itself"><span class="bar"><i style="width:${Math.round(100 * i.subsDone / i.subs)}%"></i></span>${i.subsDone} of ${i.subs} sub-issues done</span>` : ""}
       <span class="i-labels">${i.labels.map(l => `<span class="lbl"${/^[0-9a-f]{6}$/i.test(l.color || "") ? ` style="--c:#${l.color}"` : ""}>${esc(l.name)}</span>`).join("")}</span>
@@ -402,7 +425,7 @@ function renderIssues() {
   $("selCount").textContent = n ? n + (n === 1 ? " issue selected" : " issues selected") : "Nothing selected";
   $("runBtn").disabled = n === 0;
   OLD = [...SEL].filter(x => left.has(x)).sort((a, b) => a - b);
-  $("runBtn").textContent = OLD.length ? "Discard old work and run" : (n > 1 ? "Run " + n + " issues" : "Run");
+  $("runBtn").textContent = OLD.length ? "Run fresh attempt" : (n > 1 ? "Run " + n + " issues" : "Run");
 }
 async function loadIssues(refresh) {
   const params = new URLSearchParams({ repo: SELECTED_REPO });
@@ -535,13 +558,18 @@ function renderQueue(q) {
   QUEUE = q; BUSY = !!q.running; renderModels(q.models);
   $("provider").textContent = q.provider || "";
   $("budgetUnit").textContent = q.usage_unit || "";
+  $("budget").min = q.min_session_limit;
+  $("budget").step = q.provider === "copilot" ? "any" : "0.01";
+  $("budget").title = q.provider === "copilot" ? "Copilot requires a minimum limit of " + q.min_session_limit + " AI credits per step." : "";
+  $("runBudget").textContent = "Run limit: " + (q.run_limit ? q.run_limit + " " + q.usage_unit : "unlimited");
   if (first || providerChanged) $("budget").value = q.session_limit;
+  if (first) $("transcripts").checked = !!q.transcripts;
   $("audit").disabled = q.provider !== "claude";
   if ($("audit").disabled) $("audit").checked = false;
   const chips = [];
-  if (q.running) chips.push(`<span class="chip run">running #${q.running.issue}</span>`);
+  if (q.running) chips.push(`<span class="chip run" title="${esc(q.running.branch || "")}">running #${q.running.issue}</span>`);
   (q.queued || []).forEach(j => chips.push(`<span class="chip warn">queued #${j.issue}</span>`));
-  (q.history || []).slice(-6).reverse().forEach(j => chips.push(`<span class="chip ${exitCls(j.exit)}" title="${esc(j.err || "")}">#${j.issue} ${esc(j.exit || "failed")}</span>`));
+  (q.history || []).slice(-6).reverse().forEach(j => chips.push(`<span class="chip ${exitCls(j.exit)}" title="${esc([j.branch, j.err].filter(Boolean).join(" · "))}">#${j.issue} ${esc(j.exit || "failed")}</span>`));
   put("qstate", chips.length ? '<span class="mute">Queue</span>' + chips.join("") : "");
   // The last finished job's failure, until the same issue is running again.
   const last = (q.history || []).slice(-1)[0];
@@ -560,6 +588,52 @@ function selectionURL(path) {
   const params = new URLSearchParams({ repo: SELECTED_REPO, language: SELECTED_LANGUAGE, provider: SELECTED_AGENT });
   return path + "?" + params;
 }
+let FOLDER_REQUEST = 0, FOLDER_REPO = "";
+async function loadFolder(path) {
+  const request = ++FOLDER_REQUEST;
+  FOLDER_REPO = "";
+  $("folderUse").disabled = true;
+  $("folderUp").disabled = true;
+  $("folderList").replaceChildren();
+  $("folderStatus").textContent = "Loading folders...";
+  try {
+    const data = await post("/api/folders", { path });
+    if (request !== FOLDER_REQUEST || !$("folderPicker").open) return;
+    $("folderPath").value = data.path;
+    $("folderUp").dataset.path = data.parent;
+    $("folderUp").disabled = data.parent === data.path;
+    $("folderList").innerHTML = data.directories.map(d => `<li><button class="btn" type="button" data-path="${esc(d.path)}">${esc(d.name)}</button></li>`).join("");
+    FOLDER_REPO = data.repo;
+    $("folderStatus").textContent = data.repo ? "Git repository: " + data.repo : data.git_error;
+    $("folderUse").disabled = !data.repo;
+  } catch (e) {
+    if (request === FOLDER_REQUEST) $("folderStatus").textContent = "Cannot browse: " + e.message;
+  }
+}
+$("browseRepo").addEventListener("click", () => {
+  $("folderPicker").showModal();
+  $("folderPath").value = $("repoPath").value.trim();
+  loadFolder($("folderPath").value);
+});
+$("folderCancel").addEventListener("click", () => $("folderPicker").close());
+$("folderPicker").addEventListener("close", () => { FOLDER_REQUEST++; FOLDER_REPO = ""; });
+$("folderForm").addEventListener("submit", e => { e.preventDefault(); loadFolder($("folderPath").value); });
+$("folderPath").addEventListener("input", () => {
+  FOLDER_REQUEST++; FOLDER_REPO = ""; $("folderUse").disabled = true;
+  $("folderStatus").textContent = "Press Go to check this folder.";
+});
+$("folderHome").addEventListener("click", () => loadFolder(""));
+$("folderUp").addEventListener("click", () => loadFolder($("folderUp").dataset.path));
+$("folderList").addEventListener("click", e => {
+  const button = e.target.closest("button[data-path]");
+  if (button) loadFolder(button.dataset.path);
+});
+$("folderUse").addEventListener("click", () => {
+  if (!FOLDER_REPO) return;
+  $("repoPath").value = FOLDER_REPO;
+  $("folderPicker").close();
+  $("selectRepo").click();
+});
 $("selectRepo").addEventListener("click", async () => {
   SELECTED_REPO = $("repoPath").value.trim();
   SELECTED_LANGUAGE = $("language").value;
@@ -589,21 +663,18 @@ $("pipe").addEventListener("click", e => {
   PICKED = b.dataset.s; tick();
 });
 $("runBtn").addEventListener("click", async () => {
+  if (QUEUE.provider === "copilot" && !$("budget").reportValidity()) return;
   const issues = [...SEL].sort((a, b) => a - b);
   const publish = $("publish").value;
   const parents = issues.filter(n => (ISSUES.find(i => i.number === n) || {}).subs);
   if (!confirm("Run " + issues.map(n => "#" + n).join(", ") + (publish ? " and open draft PRs (this pushes branches)" : " locally") + "?"
-    + (OLD.length ? "\n\n" + OLD.map(n => "#" + n).join(", ") + " still has a worktree from an earlier run. It and its branch sm/issue-<n> will be deleted, with any staged changes in it. This cannot be undone." : "")
+    + "\n\nExisting branches and worktrees are kept. Each fresh attempt starts from the issue's base and uses the next available numbered name."
     + (parents.length ? "\n\n" + parents.map(n => "#" + n).join(", ") + " has sub-issues: its open sub-issues run in its place, one after another. Sub-issues that depend on an open issue are skipped." : ""))) return;
   $("msg").textContent = "";
   try {
     SEL.clear(); PICKED = null;
-    const body = { issues, repo: SELECTED_REPO, language: SELECTED_LANGUAGE, publish, provider: SELECTED_AGENT, audit: $("audit").checked, budget: $("budget").value, discard: OLD.length > 0, models: chosenModels() };
-    // 409: a sub-issue that would run has old work, which only the server can see.
-    const q = await post("/api/run", body).catch(e => {
-      if (e.status !== 409 || !confirm(e.message + "\n\nDiscard old work and run?")) throw e;
-      return post("/api/run", { ...body, discard: true });
-    });
+    const body = { issues, repo: SELECTED_REPO, language: SELECTED_LANGUAGE, publish, provider: SELECTED_AGENT, audit: $("audit").checked, transcripts: $("transcripts").checked, budget: $("budget").value, models: chosenModels() };
+    const q = await post("/api/run", body);
     renderQueue(q); $("msg").textContent = (q.notes || []).join(" · "); tick();
   }
   catch (e) { $("msg").textContent = "Cannot start: " + e.message; }

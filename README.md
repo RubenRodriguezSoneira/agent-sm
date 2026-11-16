@@ -20,23 +20,37 @@ Exits: `ready`, `gave-up`, `errored`, `split`, `escalated`, `stopped`.
 
 Sub-issues: on the page, an issue with GitHub sub-issues shows its progress. Selecting it queues
 its open sub-issues in its place, one after another; the issue itself never runs. A sub-issue is
-skipped when GitHub lists an open issue as blocking it, when its body's Dependencies section names
-an open issue, or when it has sub-issues of its own (select that one directly). The command line
-still runs exactly the one issue it is given.
+skipped when GitHub lists an open issue as blocking it, when its body's explicit dependency entries
+name an open issue, or when it has sub-issues of its own (select that one directly). Body dependencies
+are list entries under `Dependencies` (for example `- #5`) or lines starting with `Depends on` or
+`Blocked by` under `Dependencies`/`Depends on`. Parent/Epic/Related lines and contextual prose
+(including Story-gate explanations) are not blockers. Native GitHub blockers are also checked
+before an agent starts, including for direct CLI runs; failed lookups stop the run.
+The command line still runs exactly the one issue it is given. Failed queue entries show the
+recorded error, when available, rather than only an `errored` label.
 
 Re-running an issue: a run that does not merge leaves its worktree and its `sm/issue-<n>` branch,
-because for a local-only run the staged changes there are the result. The page marks such an
-issue "old work"; selecting it turns Run into "Discard old work and run", which deletes that
-worktree and local branch first. A branch on origin or an existing PR is never deleted.
+because for a local-only run the staged changes there are the result. Earlier attempts are
+never discarded by a new run. If the branch or worktree is occupied, the next attempt uses
+`sm/issue-<n>-1` and `<n>-sm-1`, then `-2`, `-3`, and so on, choosing the first available pair.
+Local branches, branches on origin, existing PR heads (including closed PRs), and worktree
+paths all reserve their names. Failed lookups stop the run rather than assuming a name is free.
+Every attempt starts fresh from the issue's declared/configured base, not from earlier work.
+The page marks previous work as kept; web attempts also retain separate logs. Publishing
+refuses to overwrite a remote branch that appeared after the name was selected.
 
-The repo's working tree must be clean; the run creates the branch `sm/issue-<n>`. It needs
+The repo's working tree must be clean; the run creates an available `sm/issue-<n>` branch. It needs
 `copilot` (or `claude`), `git` and `gh` on the PATH, authenticated independently of the desktop
 app, plus the target project's build/test tools. Checks must be configured; there is no
 implicit Cargo default. `stats` and `allow` do not require a project profile.
 
 With no arguments or config, `go run .` starts the web UI in the current Git repo. It detects Go
 projects and the bundled Inventory .NET sample, and prefers the installed Copilot CLI, then Claude.
-If the current directory is not a Git repo, enter a local repo path in the page. Unknown languages
+Use **Browse folders** to navigate local folders and select a Git working tree, or enter its path
+manually. The picker validates Git before enabling selection and resolves subfolders to their
+repository root; linked worktrees are supported too. Non-Git folders and unreadable/missing paths
+show an error, and nothing is initialized or uploaded. Folders belong to the computer running
+agent-sm (the same PC for a local launch). Unknown languages
 use a basic `git diff --check`; configure real build/test checks for meaningful verification.
 You can override the detected language profile and agent in the page. The .NET example targets a
 specific sample solution and is not universal. The page is loopback-only and token-protected, but
@@ -52,8 +66,8 @@ in place; delete it before running the issue again.
 | `SM_PUBLISH` | empty | empty: stop at a local staged branch. `pr`: commit, rebase, push, open a draft PR. `merge`: also merge it. |
 | `SM_BASE` | `origin/main` | Branch that worktrees start from and publish rebases onto. |
 | `SM_PROVIDER` | `copilot` | Runner: `copilot` or `claude`. |
-| `SM_SESSION_LIMIT` | `2` | Session limit in the provider's native units: Copilot AI credits or Claude USD. |
-| `SM_RUN_LIMIT` | `20` | Run limit in the same native units; `0` disables it. Unknown usage prevents another step under a run limit. |
+| `SM_SESSION_LIMIT` | Copilot: `100`; Claude: `2` | Session limit in the provider's native units: Copilot AI credits (minimum 100) or Claude USD. |
+| `SM_RUN_LIMIT` | Copilot: `500`; Claude: `20` | Run limit in the same native units; `0` disables it. A nonzero Copilot limit must be at least 100. Unknown usage prevents another step under a run limit. |
 | `SM_BUDGET`, `SM_RUN_BUDGET` | none | Legacy Claude-only dollar-limit aliases. Rejected for Copilot rather than converted to credits. |
 | `SM_TIMEOUT` | `60` | Minutes before an agent session and its child processes are killed. |
 | `SM_MODEL_<STATE>` | Copilot: `auto`; Claude: sonnet 5.5, opus 5.5 for review | Explicit CLI model ID per step. The web input wins for queued runs. |
@@ -64,6 +78,7 @@ in place; delete it before running the issue again.
 | `SM_ADD_DIRS` | none | Comma-separated directories agents may read outside the repo. |
 | `SM_NOTES_DIR` | none | Operator notes added to dispatches: `all.md`, or `<role>.md` for one step. |
 | `SM_AUDIT` | off | Claude only: load every tool and bypass permissions (outward commands stay denied) to measure tool use. Not a sandbox. |
+| `SM_TRANSCRIPTS` | `false` | Opt-in local transcript saving for either provider (`true`/`false` or `1`/`0`). Independent of permission audit. |
 | `SM_GHIDRA_COPY` | `none` | Legacy-profile-only Ghidra project copy. |
 | `SM_EXPORT` | `~/rescue-re/export` | Legacy-profile-only export; generic runs do not inspect it. |
 | `SM_EPIC` | none | Epic that a follow-up issue joins (split, or three failed fix rounds). |
@@ -75,11 +90,15 @@ A session that hits `SM_TIMEOUT` returns `timeout`; an observed native limit exh
 returns `over-budget`. Both end with `gave-up`. Unknown/missing usage is never reported as
 free and stops a bounded run before its next step. Unknown CLI errors fail closed as invalid,
 not as completed work. Native billing limits can be soft/provider-enforced, not exact money caps.
+Copilot's 100-credit minimum is a per-step limit, not a required charge. If fewer than 100
+credits remain under the run limit, the next Copilot step stops instead of exceeding that limit.
+Explicit lower limits are rejected; changing providers on the page uses that provider's defaults
+rather than interpreting credits as dollars or vice versa.
 
 ## Profiles and tools
 
 Pass an explicit operator-owned JSON file; configuration is never auto-discovered in a target
-branch. See [Go](examples/go.json), [.NET unit testing](examples/dotnet-unit.json), and
+branch. See [Go](examples/go.json), [.NET unit testing](examples/dotnet.json), and
 [legacy Claude/Rust/Ghidra](examples/claude-legacy.json). Copy and adapt the examples outside
 the target checkout. Precedence is defaults, profile, environment, then validated web overrides.
 Relative `notes_dir` and `add_dirs` paths resolve against the profile's directory. Queued runs
@@ -87,9 +106,10 @@ receive an immutable resolved snapshot, including models and limits.
 
 Supported fields are `provider`, `models` (state to CLI model ID), `checks`, `format`,
 `required_test_reports`, `session_limit`, `run_limit`, `timeout_minutes`, `commands`,
-`notes_dir`, `add_dirs`, `base`, `jira`, `management`, and the Claude-specific `claude_allow`,
+`notes_dir`, `add_dirs`, `base`, `jira`, `management`, `transcripts`, and the Claude-specific `claude_allow`,
 `claude_extra_allow`, `audit`, and `legacy_rust_ghidra`. Unknown fields fail startup.
-The server uses one provider per profile; restart with another profile to change it.
+The page can select either provider; switching providers uses that provider's limit defaults,
+while provider-specific options still require a compatible profile.
 
 `checks` are trusted shell commands run deterministically in the worktree, including after a
 publish rebase. They have timeout/Stop cancellation and must not mutate the checked candidate.
@@ -135,12 +155,14 @@ GitHub remains the queue; Jira tickets are not independent run inputs. An issue 
 ## Jira
 - **Jira issue:** https://your-team.atlassian.net/browse/TEAM-42
 - **Jira Epic:** https://your-team.atlassian.net/browse/TEAM-1
-- **Base branch:** feature/integration
+- **Base branch:** `feature/integration` (parent Story #12).
 ```
 
 Only `Jira issue` identifies this ticket's counterpart. The declared base is used for worktree
-creation, the task branch, rebasing, and the draft PR's actual base. Otherwise `SM_BASE`/profile
-`base` applies. A linked Jira key is included in the PR title.
+creation, the task branch, rebasing, and the draft PR's actual base. A backticked branch may
+have a trailing parenthetical note without other backticked values; service edits retain it when
+preserving the body. If no base is declared, `SM_BASE`/profile `base` applies. A linked Jira key
+is included in the PR title.
 
 Jira is off by default. Adapt [the Action-owned example](examples/jira-actions.json), including
 your workflow's exact status names. It assumes the target repository already has a trusted
@@ -310,10 +332,19 @@ the complete history; large installations should compact/split this state before
 
 ## Run data
 
-- `<scratch>/events.jsonl`: one line per step, per agent session and the exit. When a new run of the issue starts, the old log is renamed to `events-<date>-<time>.jsonl`, not deleted.
+- Web run data is stored under `<scratch-root>/repos/<repository-hash>/<issue>/`, with numbered retries in `attempt-1/`, `attempt-2/`, etc.
+- `<scratch>/events.jsonl`: structured step results, errors (including CLI stderr), agent sessions and the exit. If a scratch directory is reused, the old event log is renamed to `events-<date>-<time>.jsonl`, not deleted.
 - The scratch root is durable, so run history survives a reboot. Agents also write probe output (traces, dumps) there; delete an issue's directory when you no longer need it.
 - `<scratch>/status.json`: the running session's live state. `<scratch>/run.log`: output of a run started from the page.
+- Optional transcripts: select **Save transcripts** before Run, set `"transcripts": true` in a profile, or use `SM_TRANSCRIPTS=1`. Each agent call/retry gets a separate private directory at `<scratch>/transcripts/<provider>-<step>-<unique>/`; its path is recorded in `events.jsonl`.
+  - `request.json`: exact CLI arguments (including prompts), working directory, schema and start time; no environment dump.
+  - `stdout.log` / `stderr.log`: raw CLI streams captured before JSON validation, including malformed output. Claude's stdout includes its message/tool stream and native usage.
+  - Copilot also retains `usage.json` and copies its native session events to `messages.jsonl` after the subprocess exits. This requires CLI support for `--session-id`, `--sync-session=off` and the documented local session-state layout. Session sync is disabled for these captured Copilot calls; no gist/share upload is requested.
+  - `result.json`: agent-call outcome, finish time and any capture error. A logging failure prevents successful workflow continuation, even if the provider itself returned a valid result; provider usage statistics still describe that provider call.
+  - Captures contain only messages exposed by the CLI, not hidden model reasoning. Cancellation, output limits, startup failure or disk errors can leave partial captures; a missing native session log is recorded explicitly. Transcripts are not reconstructed for past runs.
+  - Transcripts can contain source code, secrets or sensitive tool output. Directories are private (`0700`), app-created files use `0600`, and nothing expires automatically. Review/delete them when no longer needed; Copilot also retains its original local session history separately. This does **not** enable Claude's permission-bypassing **permission audit**.
 - `agent-sm-stats.jsonl` (`SM_STATS`): one line per agent session. It is local output and is gitignored.
+- `agent-sm stats [file]` summarizes usage and models by provider/state. The web UI follows the latest run; queue history is in memory and resets on restart, but saved run files remain available. There is no older-run picker yet.
 - `runs/`: archived attempts kept in the repo as evidence for the issues that cite them. Nothing writes there.
 
 ## Platforms

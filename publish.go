@@ -52,8 +52,12 @@ func publish(c *Ctx) Out {
 	if c.Level == levelNone {
 		return Ok
 	}
+	if err := checkRunBranch(c); err != nil {
+		logEvent(map[string]any{"event": "publish-error", "err": err.Error()})
+		return Fail
+	}
 	n := strconv.Itoa(c.Issue)
-	branch := "sm/issue-" + n
+	branch := c.Branch
 	if _, clean := sh(c.Repo, "git", "diff", "--cached", "--quiet"); clean == nil {
 		logEvent(map[string]any{"event": "publish-error", "err": "nothing staged"})
 		return Fail
@@ -89,7 +93,8 @@ func publish(c *Ctx) Out {
 			return Fail
 		}
 	}
-	if _, ok := git(c, "push", "-u", "origin", branch); !ok {
+	// Create only: a branch pushed by another run must never be overwritten.
+	if _, ok := git(c, "push", "--force-with-lease=refs/heads/"+branch+":", "-u", "origin", branch); !ok {
 		return Fail
 	}
 

@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,11 +23,11 @@ import (
 //go:embed web/index.html
 var indexHTML []byte
 
-//go:embed examples/go.json examples/dotnet-unit.json
+//go:embed examples/go.json examples/dotnet.json
 var languageProfileFiles embed.FS
 
 func languageProfile(name string) (Profile, error) {
-	path := map[string]string{"go": "examples/go.json", "dotnet": "examples/dotnet-unit.json"}[name]
+	path := map[string]string{"go": "examples/go.json", "dotnet": "examples/dotnet.json"}[name]
 	if path == "" {
 		return Profile{}, fmt.Errorf("unknown language profile %q", name)
 	}
@@ -81,8 +80,18 @@ func autoProfile(repo string) (Profile, error) {
 	if err != nil {
 		return Profile{}, err
 	}
-	p.Provider = autoProvider()
-	return p, nil
+	provider := autoProvider()
+	if v := os.Getenv("SM_PROVIDER"); v != "" {
+		provider = v
+	}
+	p.selectProvider(provider)
+	if err := p.applyLimitEnv(); err != nil {
+		return p, err
+	}
+	if err := p.applyTranscriptEnv(); err != nil {
+		return p, err
+	}
+	return p, p.validate()
 }
 
 func canonicalRepo(path string) (string, error) {
@@ -95,9 +104,71 @@ func canonicalRepo(path string) (string, error) {
 	}
 	out, err := sh(absolute, "git", "rev-parse", "--show-toplevel")
 	if err != nil {
-		return "", fmt.Errorf("not a Git repository: %s", tail(out, 300))
+		return "", fmt.Errorf("not a Git working tree: %w: %s", err, tail(out, 300))
 	}
 	return filepath.Abs(strings.TrimSpace(out))
+}
+
+type folderEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+type folderListing struct {
+	Path        string        `json:"path"`
+	Parent      string        `json:"parent"`
+	Directories []folderEntry `json:"directories"`
+	Repo        string        `json:"repo"`
+	GitError    string        `json:"git_error,omitempty"`
+}
+
+func folderRoutes(mux *http.ServeMux, authed func(http.ResponseWriter, *http.Request) bool) {
+	mux.HandleFunc("/api/folders", func(w http.ResponseWriter, r *http.Request) {
+		if !authed(w, r) {
+			return
+		}
+		var req *struct {
+			Path string `json:"path"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&req) != nil || req == nil || decoder.Decode(new(any)) != io.EOF {
+			http.Error(w, "bad folder request", http.StatusBadRequest)
+			return
+		}
+		path := req.Path
+		if path == "" {
+			var err error
+			path, err = os.UserHomeDir()
+			if err != nil {
+				http.Error(w, "cannot locate home folder: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		path, err := filepath.Abs(path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			http.Error(w, "cannot read folder: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		listing := folderListing{Path: path, Parent: filepath.Dir(path), Directories: []folderEntry{}}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				listing.Directories = append(listing.Directories, folderEntry{Name: entry.Name(), Path: filepath.Join(path, entry.Name())})
+			}
+		}
+		listing.Repo, err = canonicalRepo(path)
+		if err != nil {
+			listing.GitError = err.Error()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(listing)
+	})
 }
 
 // eventsPath is where logEvent also appends (set in main; SM_EVENTS overrides).
@@ -150,6 +221,9 @@ func latestRun(root string) (dir, issue string) {
 		}
 		return nil
 	})
+	if strings.HasPrefix(issue, "attempt-") {
+		issue = filepath.Base(filepath.Dir(dir))
+	}
 	return dir, issue
 }
 
@@ -230,8 +304,8 @@ func serve(issue, addr, repo string) error {
 			if defaultRepo != "" {
 				if n, err := strconv.Atoi(issue); err == nil {
 					candidate := runScratch(defaultRepo, n)
-					if _, err := os.Stat(filepath.Join(candidate, "events.jsonl")); err == nil {
-						scratch = candidate
+					if latest, _ := latestRun(candidate); latest != "" {
+						scratch = latest
 					}
 				}
 			}
@@ -309,6 +383,7 @@ func serve(issue, addr, repo string) error {
 		}
 		return true
 	}
+	folderRoutes(mux, authed)
 	ctx, cancel := context.WithCancel(runCtx)
 	defer cancel()
 	var management *manager
@@ -359,14 +434,9 @@ func serve(issue, addr, repo string) error {
 				if !seen[i] {
 					seen[i] = true
 					jobs = append(jobs, Job{Issue: i, Repo: run.repo, Publish: req.Publish, Audit: req.Audit, Budget: req.Budget,
-						Discard: req.Discard, Models: req.Models, Provider: profile.Provider, Profile: &profile})
+						Models: req.Models, Provider: profile.Provider, Profile: &profile})
 				}
 			}
-		}
-		// A selected parent runs its sub-issues, which the page cannot check for old work: ask it to confirm.
-		if old := oldWork(jobs, run.leftovers()); old != "" && !req.Discard {
-			http.Error(w, old+" still has a worktree from an earlier run. It and its branch sm/issue-<n> will be deleted, with any staged changes in it. This cannot be undone.", http.StatusConflict)
-			return
 		}
 		run.Enqueue(jobs)
 		snap := queueSnapshot(run, profile)
@@ -424,21 +494,26 @@ func serve(issue, addr, repo string) error {
 }
 
 type runRequest struct {
-	Issues   []int             `json:"issues"`
-	Repo     string            `json:"repo,omitempty"`
-	Language string            `json:"language,omitempty"`
-	Publish  string            `json:"publish"`
-	Audit    bool              `json:"audit"`
-	Budget   string            `json:"budget"`
-	Discard  bool              `json:"discard"`
-	Models   map[string]string `json:"models"`
-	Provider string            `json:"provider"`
+	Issues      []int             `json:"issues"`
+	Repo        string            `json:"repo,omitempty"`
+	Language    string            `json:"language,omitempty"`
+	Publish     string            `json:"publish"`
+	Audit       bool              `json:"audit"`
+	Transcripts *bool             `json:"transcripts,omitempty"`
+	Budget      string            `json:"budget"`
+	Models      map[string]string `json:"models"`
+	Provider    string            `json:"provider"`
 }
 
 func queueSnapshot(r *Runner, p Profile) map[string]any {
 	snap := r.Snapshot()
 	snap["provider"], snap["models"] = p.Provider, agentModelsFor(p)
+	snap["transcripts"] = p.Transcripts
 	snap["session_limit"], snap["usage_unit"] = p.SessionLimit, p.unit()
+	snap["run_limit"], snap["min_session_limit"] = p.RunLimit, 0.01
+	if p.Provider == "copilot" {
+		snap["min_session_limit"] = minCopilotCredits
+	}
 	return snap
 }
 
@@ -459,7 +534,7 @@ func queuedProfile(req runRequest) (Profile, error) {
 		p.Legacy = language.Legacy
 	}
 	if req.Provider != "" {
-		p.Provider = req.Provider
+		p.selectProvider(req.Provider)
 	}
 	b, err := json.Marshal(p)
 	if err != nil {
@@ -473,6 +548,9 @@ func queuedProfile(req runRequest) (Profile, error) {
 		resolved.Models = map[string]string{}
 	}
 	resolved.Audit = req.Audit
+	if req.Transcripts != nil {
+		resolved.Transcripts = *req.Transcripts
+	}
 	if req.Budget != "" {
 		resolved.SessionLimit, err = strconv.ParseFloat(req.Budget, 64)
 		if err != nil {
@@ -483,15 +561,4 @@ func queuedProfile(req runRequest) (Profile, error) {
 		resolved.Models[state] = model
 	}
 	return resolved, resolved.validate()
-}
-
-// oldWork names the jobs whose issue still has a worktree from an earlier run, as "#1, #2".
-func oldWork(jobs []Job, leftover []int) string {
-	var old []string
-	for _, j := range jobs {
-		if slices.Contains(leftover, j.Issue) {
-			old = append(old, "#"+strconv.Itoa(j.Issue))
-		}
-	}
-	return strings.Join(old, ", ")
 }

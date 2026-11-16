@@ -49,6 +49,11 @@ func TestManagementPreservesHumanFieldsAndRemovesApprovedEdges(t *testing.T) {
 	m, f := appliedManager(t)
 	ctx := context.Background()
 	f.gh[10].Labels = []struct{ Name string }{{"human"}, {"old"}}
+	annotatedBase := "- **Base branch**: `main` (parent **Story** #12)."
+	f.gh[10].Body = strings.Replace(f.gh[10].Body, "- **Base branch**: `main`", annotatedBase, 1)
+	if !strings.Contains(f.gh[10].Body, annotatedBase) {
+		t.Fatal("base annotation fixture not inserted")
+	}
 	f.gh[10].Body += "\n\n## Notes\nHuman notes"
 	desc, _ := appendADF(f.jira["DEMO-10"].Fields.Description, "Human ADF content")
 	f.jira["DEMO-10"].Fields.Description, _ = json.Marshal(desc)
@@ -69,6 +74,9 @@ func TestManagementPreservesHumanFieldsAndRemovesApprovedEdges(t *testing.T) {
 	}
 	if !strings.Contains(f.gh[10].Body, "Human notes") {
 		t.Fatal("human issue content lost")
+	}
+	if !strings.Contains(f.gh[10].Body, annotatedBase) {
+		t.Fatal("base branch annotation lost")
 	}
 	if f.jira["DEMO-10"].Fields.Parent != nil {
 		t.Fatal("Jira parent not detached")
@@ -91,6 +99,31 @@ func TestManagementPreservesHumanFieldsAndRemovesApprovedEdges(t *testing.T) {
 	}
 	if len(f.deps[12]) != 0 || len(f.jira["DEMO-12"].Fields.Links) != 0 {
 		t.Fatal("dependency removal not mirrored")
+	}
+}
+
+func TestGitHubBodyPreservesBaseAnnotation(t *testing.T) {
+	for _, tc := range []struct{ body, line string }{
+		{"- **Base branch**: `main` (parent **Story** #12).\n\n## Jira\nOther notes", "- **Base branch**: `main` (parent **Story** #12)."},
+		{"## Jira\n- **Base branch:** **`main`** (parent **Story** #12).", "- **Base branch:** **`main`** (parent **Story** #12)."},
+		{"## Jira\n- **Base branch :** `main` (parent **Story** #12).", "- **Base branch :** `main` (parent **Story** #12)."},
+		{"- **Base branch**: `main` (parent **Story** #12).", "- **Base branch**: `main` (parent **Story** #12)."},
+		{"## Jira\n**Base branch: `main` (parent Story #12).**", "**Base branch: `main` (parent Story #12).**"},
+	} {
+		for _, base := range []string{"main", "feature"} {
+			got := githubBody(tc.body, "https://jira.example/browse/DEMO-1", base, "agent-sm:test:item")
+			line := strings.Replace(tc.line, "`main`", "`"+base+"`", 1)
+			if strings.Count(got, line) != 1 {
+				t.Errorf("base annotation changed from %q:\n%s", tc.body, got)
+			}
+			meta, err := issueMetadata(got)
+			if err != nil || meta.Base != "origin/"+base {
+				t.Errorf("rewritten metadata: %+v %v", meta, err)
+			}
+			if again := githubBody(got, "https://jira.example/browse/DEMO-1", base, "agent-sm:test:item"); again != got {
+				t.Errorf("rewrite is not idempotent:\n%s\n%s", got, again)
+			}
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +25,6 @@ type Job struct {
 	Publish    string            `json:"publish"` // "" (local only) or "pr"; merge is CLI-only
 	Audit      bool              `json:"audit"`
 	Budget     string            `json:"budget"`
-	Discard    bool              `json:"discard"`          // remove an earlier run's worktree and branch first
 	Models     map[string]string `json:"models,omitempty"` // state -> model chosen on the page
 	Started    string            `json:"started,omitempty"`
 	Worktree   string            `json:"worktree,omitempty"`
@@ -32,6 +32,7 @@ type Job struct {
 	Err        string            `json:"err,omitempty"`
 	Provider   string            `json:"provider,omitempty"`
 	Base       string            `json:"base,omitempty"`
+	Branch     string            `json:"branch,omitempty"`
 	Profile    *Profile          `json:"-"`
 	Management string            `json:"management,omitempty"`
 }
@@ -50,8 +51,9 @@ type Runner struct {
 }
 
 var (
-	budgetRe = regexp.MustCompile(`^\d+(\.\d+)?$`)
-	modelRe  = regexp.MustCompile(`^[a-z0-9][a-z0-9.\-]{0,63}$`)
+	budgetRe       = regexp.MustCompile(`^\d+(\.\d+)?$`)
+	modelRe        = regexp.MustCompile(`^[a-z0-9][a-z0-9.\-]{0,63}$`)
+	worktreeNameRe = regexp.MustCompile(`^([1-9][0-9]*)-sm(?:-[1-9][0-9]*)?$`)
 )
 
 // agentModels is each agent state's current default model, for the page's pickers.
@@ -127,53 +129,51 @@ func (r *Runner) worktreeRoot() string {
 // leftovers lists the issues whose worktree from an earlier run is still there.
 func (r *Runner) leftovers() []int {
 	out := []int{}
-	dirs, _ := filepath.Glob(filepath.Join(r.worktreeRoot(), "*-sm"))
+	dirs, _ := filepath.Glob(filepath.Join(r.worktreeRoot(), "*-sm*"))
 	for _, d := range dirs {
-		if n, err := strconv.Atoi(strings.TrimSuffix(filepath.Base(d), "-sm")); err == nil {
-			out = append(out, n)
+		match := worktreeNameRe.FindStringSubmatch(filepath.Base(d))
+		if match != nil {
+			if n, err := strconv.Atoi(match[1]); err == nil && !slices.Contains(out, n) {
+				out = append(out, n)
+			}
 		}
 	}
+	slices.Sort(out)
 	return out
 }
 
-// worktree makes a fresh detached worktree of the base branch for the issue. An earlier run's
-// worktree holds that run's result (its staged changes), so it is only removed, with its local
-// branch, when discard says so.
-func (r *Runner) worktree(n int, discard bool) (string, error) {
-	return r.worktreeAt(n, discard, baseBranch())
-}
-
-func (r *Runner) worktreeAt(n int, discard bool, base string) (string, error) {
-	dir := filepath.Join(r.worktreeRoot(), fmt.Sprintf("%d-sm", n))
-	if _, err := os.Stat(dir); err == nil {
-		if !discard {
-			return "", fmt.Errorf("worktree %s already exists from an earlier run: select the issue again and use \"Discard old work and run\"", dir)
-		}
-		if out, err := sh(r.repo, "git", "worktree", "remove", "--force", dir); err != nil {
-			return "", fmt.Errorf("cannot discard %s: %s", dir, tail(out, 300))
-		}
-	}
-	if discard {
-		sh(r.repo, "git", "branch", "-D", "sm/issue-"+strconv.Itoa(n)) // absent is fine
+// worktreeAt reserves a fresh branch and worktree without touching earlier attempts.
+func (r *Runner) worktreeAt(n int, base string) (string, string, error) {
+	branch, dir, err := nextIssueBranch(r.repo, n, r.worktreeRoot())
+	if err != nil {
+		return "", "", err
 	}
 	if strings.HasPrefix(base, "origin/") {
 		if out, err := sh(r.repo, "git", "fetch", "--", "origin", strings.TrimPrefix(base, "origin/")); err != nil {
-			return "", fmt.Errorf("fetch base: %s", tail(out, 300))
+			return "", "", fmt.Errorf("fetch base: %s", tail(out, 300))
 		}
 	}
-	if out, err := sh(r.repo, "git", "worktree", "add", "--detach", dir, base); err != nil {
-		return "", fmt.Errorf("git worktree add: %s", tail(out, 300))
+	if out, err := sh(r.repo, "git", "worktree", "add", "-b", branch, dir, base); err != nil {
+		return "", "", fmt.Errorf("git worktree add: %s", tail(out, 300))
 	}
 	for _, f := range strings.Split(os.Getenv("SM_LINKS"), ",") { // gitignored files the run needs, e.g. the ROM dump
 		if f = strings.TrimSpace(f); f != "" {
 			os.Symlink(filepath.Join(r.repo, f), filepath.Join(dir, f))
 		}
 	}
-	return dir, nil
+	return dir, branch, nil
+}
+
+func (j *Job) scratch() string {
+	dir := runScratch(j.Repo, j.Issue)
+	if suffix := strings.TrimPrefix(j.Branch, issueBranchName(j.Issue, 0)); suffix != "" {
+		dir = filepath.Join(dir, "attempt"+suffix)
+	}
+	return dir
 }
 
 func childEnv(j *Job, stats string) []string {
-	skip := map[string]bool{"SM_SCRATCH": true, "SM_EVENTS": true, "SM_PUBLISH": true, "SM_AUDIT": true, "SM_BUDGET": true, "SM_STATS": true, "SM_RESOLVED_CONFIG": true, "SM_WORKTREE_BASE": true}
+	skip := map[string]bool{"SM_SCRATCH": true, "SM_EVENTS": true, "SM_PUBLISH": true, "SM_AUDIT": true, "SM_BUDGET": true, "SM_STATS": true, "SM_RESOLVED_CONFIG": true, "SM_WORKTREE_BASE": true, "SM_WORKTREE_BRANCH": true}
 	var env []string
 	for _, e := range os.Environ() {
 		if k, _, _ := strings.Cut(e, "="); !skip[k] {
@@ -206,8 +206,8 @@ func childEnv(j *Job, stats string) []string {
 	}
 	p.Models = models
 	b, _ := json.Marshal(p)
-	scratch := runScratch(j.Repo, j.Issue)
-	env = append(env, "SM_RESOLVED_CONFIG="+string(b), "SM_WORKTREE_BASE="+j.Base,
+	scratch := j.scratch()
+	env = append(env, "SM_RESOLVED_CONFIG="+string(b), "SM_WORKTREE_BASE="+j.Base, "SM_WORKTREE_BRANCH="+j.Branch,
 		"SM_SCRATCH="+scratch, "SM_EVENTS="+filepath.Join(scratch, "events.jsonl"))
 	return env
 }
@@ -236,13 +236,13 @@ func (r *Runner) runOne(j *Job) {
 		base = meta.Base
 	}
 	r.set(func() { j.Base = base })
-	wt, err := r.worktreeAt(j.Issue, j.Discard, base)
+	wt, branch, err := r.worktreeAt(j.Issue, base)
 	if err != nil {
 		r.set(func() { j.Err = err.Error() })
 		return
 	}
-	r.set(func() { j.Worktree = wt })
-	scratch := runScratch(r.repo, j.Issue)
+	r.set(func() { j.Worktree, j.Branch = wt, branch })
+	scratch := j.scratch()
 	if err := os.MkdirAll(scratch, 0o755); err != nil {
 		r.set(func() { j.Err = err.Error() })
 		return
@@ -272,12 +272,24 @@ func (r *Runner) runOne(j *Job) {
 	r.set(func() { r.cmd = cmd })
 	cmd.Wait()
 	exit := "died" // no exit event: the process ended abnormally
+	diagnostic := ""
 	for _, l := range readLines(eventsPath, 1<<20) {
 		var e struct {
 			Exit, Management string
 			ManagementError  string `json:"management_error"`
+			Err              string
+			Issue            int
 		}
-		if json_unmarshal(l, &e) && e.Exit != "" {
+		if !json_unmarshal(l, &e) {
+			continue
+		}
+		if e.Err != "" {
+			diagnostic = e.Err
+			if e.Issue > 0 {
+				diagnostic += fmt.Sprintf(" (#%d)", e.Issue)
+			}
+		}
+		if e.Exit != "" {
 			exit = e.Exit
 			r.set(func() {
 				j.Management = e.Management
@@ -292,6 +304,9 @@ func (r *Runner) runOne(j *Job) {
 		exit = "stopped"
 	}
 	j.Exit = exit
+	if j.Err == "" && exit != string(Ready) && exit != "stopped" {
+		j.Err = diagnostic
+	}
 	r.mu.Unlock()
 	if p.Management.Mode == "service" && exit != string(Ready) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

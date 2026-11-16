@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,11 +19,26 @@ import (
 
 var commandPrefix = regexp.MustCompile(`^[a-zA-Z0-9_./~-]+(?: [a-zA-Z0-9_./~-]+)*$`)
 
-func agent(c *Ctx, state State, prompt string, out any) Out {
-	if settings.Provider == "claude" {
-		return claudeAgent(c, state, prompt, out)
+func agent(c *Ctx, state State, prompt string, out any) (result Out) {
+	var transcript *agentTranscript
+	if settings.Transcripts {
+		var err error
+		transcript, err = newTranscript(c, state)
+		if err != nil {
+			logEvent(map[string]any{"event": "transcript-error", "err": err.Error()})
+			return Invalid
+		}
+		defer func() {
+			if err := transcript.finish(result); err != nil {
+				logEvent(map[string]any{"event": "transcript-error", "path": transcript.dir, "err": err.Error()})
+				result = Invalid
+			}
+		}()
 	}
-	return copilotAgent(c, state, prompt, out)
+	if settings.Provider == "claude" {
+		return claudeAgent(c, state, prompt, out, transcript)
+	}
+	return copilotAgent(c, state, prompt, out, transcript)
 }
 
 func process(ctx context.Context, dir, name string, args ...string) *exec.Cmd {
@@ -90,30 +106,52 @@ func copilotArgs(state State, prompt, usagePath string, limit float64) []string 
 	return args
 }
 
-func copilotAgent(c *Ctx, state State, prompt string, out any) (res Out) {
-	ctx, cancel := context.WithTimeout(runCtx, time.Duration(settings.TimeoutMinutes*float64(time.Minute)))
-	defer cancel()
-	dir, err := os.MkdirTemp(c.Scratch, "copilot-")
-	if err != nil {
-		logEvent(map[string]any{"event": "agent-error", "err": err.Error()})
-		return Invalid
-	}
-	defer os.RemoveAll(dir) // exact per-session directory, never a caller-provided root
-	usagePath := filepath.Join(dir, "usage.json")
+func copilotAgent(c *Ctx, state State, prompt string, out any, transcript *agentTranscript) (res Out) {
 	limit := settings.SessionLimit
 	if c.RunBudget > 0 {
 		limit = min(limit, c.RunBudget-c.Cost)
-		if limit <= 0 || c.CostUnknown > 0 {
+		if c.CostUnknown > 0 {
 			return OverBudget
 		}
 	}
+	if limit < minCopilotCredits {
+		logEvent(map[string]any{"event": "run-budget-reached",
+			"err": fmt.Sprintf("Copilot requires at least %d AI credits for a step; effective limit is %.2f", minCopilotCredits, limit)})
+		return OverBudget
+	}
+	ctx, cancel := context.WithTimeout(runCtx, time.Duration(settings.TimeoutMinutes*float64(time.Minute)))
+	defer cancel()
+	var dir string
+	var err error
+	if transcript != nil {
+		dir = transcript.dir
+	} else {
+		dir, err = os.MkdirTemp(c.Scratch, "copilot-")
+		if err != nil {
+			logEvent(map[string]any{"event": "agent-error", "err": err.Error()})
+			return Invalid
+		}
+		defer os.RemoveAll(dir) // exact per-session directory, never a caller-provided root
+	}
+	usagePath := filepath.Join(dir, "usage.json")
 	args := copilotArgs(state, prompt, usagePath, limit)
+	if transcript != nil {
+		args = append(args, "--session-id", transcript.sessionID, "--sync-session=off")
+		if err := transcript.request(args, state, cancel); err != nil {
+			logEvent(map[string]any{"event": "transcript-error", "err": err.Error()})
+			return Invalid
+		}
+	}
 	cmd := process(ctx, c.Repo, "copilot", args...)
 	// Never inherit permission bypasses from a parent agent session.
 	cmd.Env = cleanAgentEnv()
 	stdout := &boundedOutput{limit: 8 << 20}
 	stderr := &boundedOutput{limit: 64 << 10}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
+	if transcript != nil {
+		cmd.Stdout = io.MultiWriter(transcript.stdout, stdout)
+		cmd.Stderr = io.MultiWriter(transcript.stderr, stderr)
+	}
 	st := &Stats{Provider: "copilot", Issue: c.Issue, State: state.String(), UsageUnknown: true}
 	if state == Investigate && len(c.Units) > 0 {
 		st.Unit = c.Units[c.UnitIdx].ID

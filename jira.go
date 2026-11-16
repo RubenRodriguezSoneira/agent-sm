@@ -89,6 +89,7 @@ var (
 	jiraURL  = regexp.MustCompile(`^https://[a-zA-Z0-9._:-]+/browse/([A-Z][A-Z0-9]*-[1-9][0-9]*)$`)
 	httpURL  = regexp.MustCompile(`https?://[^\s<>\])]+`)
 	baseName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_./-]*$`)
+	baseNote = regexp.MustCompile("^`([^`]+)`\\s+\\([^`]*\\)\\.?$")
 )
 
 func validBase(s string) bool {
@@ -124,9 +125,13 @@ func issueMetadata(body string) (issueMeta, error) {
 		if !ok {
 			continue
 		}
-		value = strings.Trim(strings.TrimSpace(value), "`")
+		rawValue := strings.TrimSpace(value)
+		value = strings.Trim(rawValue, "`")
 		switch strings.ToLower(strings.TrimSpace(key)) {
 		case "base branch":
+			if match := baseNote.FindStringSubmatch(rawValue); match != nil {
+				value = match[1]
+			}
 			if baseSeen || !validBase(value) {
 				return meta, fmt.Errorf("missing, invalid or duplicate Base branch metadata")
 			}
