@@ -67,10 +67,9 @@ func (b *boundedOutput) Write(p []byte) (int, error) {
 }
 
 func copilotArgs(state State, prompt, usagePath string, limit float64) []string {
-	// Silent text is the documented final-response transport. Validate all of stdout:
-	// no JSON extracted from prose, event envelopes, or markdown fences.
+	// Text mode renders Markdown and wraps lines, corrupting structured responses.
 	prompt = rolePrompt(state) + "\n\n" + prompt + "\n\nReturn exactly one JSON object, without markdown or other text. Required schema:\n" + steps[state].Schema
-	args := []string{"-p", prompt, "--silent", "--stream=off", "--output-format=text",
+	args := []string{"-p", prompt, "--stream=off", "--output-format=json",
 		"--model", stepModel(steps[state]), "--max-ai-credits", strconv.FormatFloat(limit, 'f', -1, 64),
 		"--usage-output-file", usagePath, "--no-ask-user", "--no-auto-update", "--disable-builtin-mcps"}
 	// Restrict visibility as well as permissions: inherited MCPs/subagents cannot
@@ -198,12 +197,74 @@ func copilotAgent(c *Ctx, state State, prompt string, out any, transcript *agent
 	if st.Credits != nil && *st.Credits >= limit {
 		return OverBudget
 	}
-	if err := validateResult(stdout.Bytes(), steps[state].Schema, out); err != nil {
+	result, resultErr := copilotResult(stdout.Bytes())
+	if resultErr != nil {
+		logEvent(map[string]any{"event": "invalid-result", "err": resultErr.Error()})
+		return Invalid
+	}
+	if err := validateResult(result, steps[state].Schema, out); err != nil {
 		logEvent(map[string]any{"event": "invalid-result", "err": err.Error()})
 		return Invalid
 	}
-	st.Result = tail(stdout.String(), 1500)
+	st.Result = tail(string(result), 1500)
 	return Ok
+}
+
+func copilotResult(raw []byte) ([]byte, error) {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	var result []byte
+	completed := false
+	for {
+		var event struct {
+			Type     string          `json:"type"`
+			AgentID  string          `json:"agentId"`
+			Data     json.RawMessage `json:"data"`
+			ExitCode *int            `json:"exitCode"`
+		}
+		if err := d.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("Copilot JSON output: %w", err)
+		}
+		if event.Type == "" || completed {
+			return nil, fmt.Errorf("Copilot JSON output: missing event type or event after final result")
+		}
+		if event.AgentID != "" {
+			continue
+		}
+		switch event.Type {
+		case "assistant.turn_start", "assistant.message_start", "assistant.message_delta":
+			result = nil
+		case "assistant.message":
+			var message struct {
+				Content          *string           `json:"content"`
+				ToolRequests     []json.RawMessage `json:"toolRequests"`
+				ParentToolCallID string            `json:"parentToolCallId"`
+			}
+			if err := json.Unmarshal(event.Data, &message); err != nil {
+				return nil, fmt.Errorf("Copilot assistant message: %w", err)
+			}
+			if message.ParentToolCallID != "" {
+				continue
+			}
+			// Never fall back to an earlier answer if the last main-agent message is incomplete.
+			result = nil
+			if message.Content != nil && len(message.ToolRequests) == 0 {
+				result = []byte(*message.Content)
+			}
+		case "session.error":
+			return nil, fmt.Errorf("Copilot reported a session error: %s", tail(string(event.Data), 1500))
+		case "result":
+			if event.ExitCode == nil || *event.ExitCode != 0 {
+				return nil, fmt.Errorf("Copilot JSON output: missing or unsuccessful final exitCode")
+			}
+			completed = true
+		}
+	}
+	if !completed || len(bytes.TrimSpace(result)) == 0 {
+		return nil, fmt.Errorf("Copilot JSON output: missing final result or complete assistant response")
+	}
+	return result, nil
 }
 
 func copilotUsage(b []byte) (float64, string, error) {

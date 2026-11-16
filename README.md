@@ -134,9 +134,13 @@ role notes for portable guidance. Copilot also loads its normal repository instr
 Do not pass app configuration as an agent-sm profile: `.github/github-app.yml` remains owned
 by the Copilot app. Old rescue-specific prompts are selected only by `legacy_rust_ghidra`.
 
-Copilot uses documented silent final-response mode, strict local JSON validation, and
-`--usage-output-file` for native credits. Its live feed currently shows start/end, not tool
-calls; unavailable model/tool/turn/usage data is marked unknown. Claude retains its stream
+Copilot uses `--output-format=json` JSONL events, strict local JSON validation, and
+`--usage-output-file` for native credits. The last complete main-agent response is decoded
+without Markdown rendering or line wrapping, and requires a successful terminal `result`
+event. Tool/sub-agent messages and partial deltas cannot substitute for that response;
+prose, code fences, malformed JSON and off-schema content are still rejected, not repaired.
+Its live feed currently shows start/end, not tool calls; unavailable model/tool/turn/usage
+data is marked unknown. Claude retains its stream
 feed. Both reject missing, duplicate, malformed, or off-schema result fields and failed
 subprocesses. Stats separate providers and units; old Claude stats remain readable.
 `allow` emits Claude syntax only; it does not infer a Copilot policy from absent telemetry.

@@ -26,6 +26,15 @@ func writeFile(t *testing.T, path, body string, mode os.FileMode) {
 	}
 }
 
+func copilotOutput(t *testing.T, content string) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"type": "assistant.message", "data": map[string]string{"content": content}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b) + "\n" + "{\"type\":\"result\",\"exitCode\":0}\n"
+}
+
 func TestResultValidation(t *testing.T) {
 	for _, raw := range []string{
 		`{}`, `{"verdict":"PASS"}`, `{"verdict":"UNKNOWN","reasons":[]}`,
@@ -462,6 +471,9 @@ func TestCopilotPolicy(t *testing.T) {
 		if strings.Contains(execute, bad) {
 			t.Errorf("overbroad policy: %s", bad)
 		}
+		if !strings.Contains(execute, "--output-format=json") || strings.Contains(execute, "--silent") {
+			t.Fatal("structured responses must not use the CLI's rendered text output")
+		}
 	}
 	t.Setenv("COPILOT_ALLOW_ALL", "true")
 	t.Setenv("JIRA_API_TOKEN", "test-token")
@@ -495,6 +507,68 @@ func TestCopilotUsage(t *testing.T) {
 	}
 }
 
+func TestCopilotResult(t *testing.T) {
+	content := `{"verdict":"PASS","reasons":["` + strings.Repeat("long response ", 30) +
+		`*.cs **literal Markdown** \n\"quoted\" C:\\source\\file.cs café"]}`
+	terminal := "{\"type\":\"result\",\"exitCode\":0}\n"
+	stream := copilotOutput(t, content)
+	message := strings.TrimSuffix(stream, terminal)
+	for _, tc := range []struct {
+		name, stream string
+		valid        bool
+	}{
+		{"unrendered JSON survives", stream, true},
+		{"tool turns before final answer", "{\"type\":\"assistant.turn_start\",\"data\":{}}\n" +
+			"{\"type\":\"assistant.message\",\"data\":{\"content\":\"Inspecting files\",\"toolRequests\":[{\"name\":\"view\"}]}}\n" +
+			"{\"type\":\"tool.execution_complete\",\"data\":{\"result\":{\"content\":\"tool output\"}}}\n" +
+			"{\"type\":\"assistant.message_delta\",\"data\":{\"deltaContent\":\"partial\"}}\n" + stream, true},
+		{"ignore child answer", message + "{\"type\":\"assistant.message\",\"agentId\":\"child\",\"data\":{\"content\":\"not the parent answer\"}}\n" + terminal, true},
+		{"ignore legacy child answer", message + "{\"type\":\"assistant.message\",\"data\":{\"content\":\"not the parent answer\",\"parentToolCallId\":\"tool\"}}\n" + terminal, true},
+		{"last main answer wins", strings.TrimSuffix(copilotOutput(t, "earlier commentary"), terminal) + stream, true},
+		{"empty stream", "", false},
+		{"rendered plain JSON is not the protocol", content, false},
+		{"missing completion", message, false},
+		{"missing answer", terminal, false},
+		{"nonzero native exit", message + "{\"type\":\"result\",\"exitCode\":1}\n", false},
+		{"missing native exit", message + "{\"type\":\"result\"}\n", false},
+		{"null native exit", message + "{\"type\":\"result\",\"exitCode\":null}\n", false},
+		{"duplicate completion", stream + terminal, false},
+		{"event after completion", stream + "{\"type\":\"session.idle\",\"data\":{}}\n", false},
+		{"truncated envelope", message + "{\"type\":", false},
+		{"non JSON diagnostics", "warning: unexpected text\n" + stream, false},
+		{"missing event type", "{}\n" + stream, false},
+		{"session error", message + "{\"type\":\"session.error\",\"data\":{\"message\":\"failed\"}}\n" + terminal, false},
+		{"tool result is not an answer", "{\"type\":\"tool.execution_complete\",\"data\":{\"content\":\"{}\"}}\n" + terminal, false},
+		{"child answer only", "{\"type\":\"assistant.message\",\"agentId\":\"child\",\"data\":{\"content\":\"{}\"}}\n" + terminal, false},
+		{"uncompleted new turn", message + "{\"type\":\"assistant.turn_start\",\"data\":{}}\n" + terminal, false},
+		{"uncompleted delta", message + "{\"type\":\"assistant.message_delta\",\"data\":{\"deltaContent\":\"partial\"}}\n" + terminal, false},
+		{"pending tool call", message + "{\"type\":\"assistant.message\",\"data\":{\"content\":\"{}\",\"toolRequests\":[{\"name\":\"view\"}]}}\n" + terminal, false},
+		{"missing content", message + "{\"type\":\"assistant.message\",\"data\":{}}\n" + terminal, false},
+		{"empty final answer", message + copilotOutput(t, ""), false},
+		{"no fallback to earlier valid JSON", message + copilotOutput(t, "not JSON"), false},
+		{"malformed model JSON", copilotOutput(t, "{\"verdict\":\"PASS\",\"reasons\":[\"raw\nnewline\"]}"), false},
+		{"off schema model JSON", copilotOutput(t, `{"verdict":"PASS"}`), false},
+		{"duplicate model keys", copilotOutput(t, `{"verdict":"PASS","verdict":"REVISE","reasons":[]}`), false},
+		{"fenced model JSON", copilotOutput(t, "```json\n"+content+"\n```"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := copilotResult([]byte(tc.stream))
+			if err == nil {
+				err = validateResult(got, steps[Review].Schema, new(any))
+			}
+			if !tc.valid {
+				if err == nil {
+					t.Fatal("accepted invalid or incomplete result")
+				}
+				return
+			}
+			if err != nil || string(got) != content {
+				t.Fatalf("changed or rejected raw message: %q, %v", got, err)
+			}
+		})
+	}
+}
+
 func TestProviderResults(t *testing.T) {
 	for _, provider := range []string{"claude", "copilot"} {
 		for _, mode := range []string{"valid", "incomplete", "failure", "unknown-usage", "budget"} {
@@ -519,7 +593,12 @@ if [ "$PROVIDER" = "copilot" ]; then
     if [ "$FIXTURE_MODE" = "budget" ]; then amount=100000000000; fi
     printf '{"totalNanoAiu":%s,"modelMetrics":{"actual-model":{}}}' "$amount" > "$usage"
   fi
-  if [ "$FIXTURE_MODE" = "incomplete" ]; then echo '{}'; else echo '{"verdict":"PASS","reasons":[]}'; fi
+  if [ "$FIXTURE_MODE" = "incomplete" ]; then
+    echo '{"type":"assistant.message","data":{"content":"{}"}}'
+  else
+    echo '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PASS\",\"reasons\":[]}"}}'
+  fi
+  echo '{"type":"result","exitCode":0}'
 else
   cost=',"total_cost_usd":0.1'
   if [ "$FIXTURE_MODE" = "unknown-usage" ]; then cost=""; fi
@@ -658,7 +737,9 @@ if [ "$SM_TEST_MODE" = "failure" ]; then exit 1; fi
 				if mode == "malformed" {
 					raw = "{\"verdict\":\"PASS\",\"reasons\":[\"raw\nnewline\"]}\n"
 				}
-				if provider == "claude" {
+				if provider == "copilot" {
+					raw = copilotOutput(t, raw)
+				} else {
 					result := `{"verdict":"PASS","reasons":[]}`
 					if mode == "malformed" {
 						result = `{"verdict":"PASS"}`
@@ -836,7 +917,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 printf '{"totalNanoAiu":100000000,"modelMetrics":{}}' > "$usage"
-printf '{"verdict":"PASS","reasons":[]}\n'
+printf '%s\n' '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PASS\",\"reasons\":[]}"}}' '{"type":"result","exitCode":0}'
 `, 0o755)
 			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv("SM_TEST_CAPTURE", capture)
@@ -960,11 +1041,12 @@ if [ -n "$session" ]; then
   printf '{"type":"assistant.message","data":{"content":"fixture session"}}\n' > "$COPILOT_HOME/session-state/$session/events.jsonl"
 fi
 case "$prompt" in
-  *"You are the planner"*) echo '{"status":"plan","objective":"deliver file","points":["file exists"],"points_derived":false,"files":["outcome.txt"],"verification":"default","needs_investigation":false,"fits_one_pr":true,"units":[]}';;
-  *"You are the implementation"*) echo delivered > outcome.txt; echo '{"status":"done","summary":"delivered file","closes_issue":true}';;
-  *"You independently review"*) echo '{"verdict":"PASS","reasons":["file verified"]}';;
+  *"You are the planner"*) echo '{"type":"assistant.message","data":{"content":"{\"status\":\"plan\",\"objective\":\"deliver file\",\"points\":[\"file exists\"],\"points_derived\":false,\"files\":[\"outcome.txt\"],\"verification\":\"default\",\"needs_investigation\":false,\"fits_one_pr\":true,\"units\":[]}"}}';;
+  *"You are the implementation"*) echo delivered > outcome.txt; echo '{"type":"assistant.message","data":{"content":"{\"status\":\"done\",\"summary\":\"delivered file\",\"closes_issue\":true}"}}';;
+  *"You independently review"*) echo '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PASS\",\"reasons\":[\"file verified\"]}"}}';;
   *) exit 1;;
 esac
+echo '{"type":"result","exitCode":0}'
 `, 0o755)
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	t.Setenv("AGENT_SM_TEST_HELPER", "1")
