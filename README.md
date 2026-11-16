@@ -314,6 +314,10 @@ Windows; use WSL.
 
 ## Tests
 
+GitHub Actions runs formatting checks, `go vet`, race-enabled tests, and a build on pull
+requests and pushes to `main`, using the Go version in `go.mod`. Live agent smoke tests
+remain opt-in and are not run in CI.
+
     go vet ./... && go test ./...
     SM_SMOKE=1 go test -run Smoke -v                     # opt-in: one real Copilot session
     SM_SMOKE=1 SM_PROVIDER=claude go test -run Smoke -v  # opt-in: one real Claude session
