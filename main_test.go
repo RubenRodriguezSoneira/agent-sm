@@ -221,6 +221,9 @@ func TestReviewDiffIsNeverCut(t *testing.T) {
 // shortcut: the commands are listed here by hand (prompts are prose); the test fails if one
 // leaves the prompt, so the list cannot rot, but a new command in a prompt must be added here.
 func TestPromptCommandsAreAllowed(t *testing.T) {
+	p := defaultProfile("claude")
+	p.Legacy = true
+	useProfile(t, p)
 	named := map[State][]string{
 		Plan:        {"gh issue view"},
 		Investigate: {"ghidra", "grep", "~/venvs/desmume/bin/python", "Export JAVA_HOME"},
@@ -234,7 +237,7 @@ func TestPromptCommandsAreAllowed(t *testing.T) {
 				t.Errorf("%v: %q is no longer in the prompt; update this test", s, cmd)
 			}
 			allowed := false
-			for _, a := range strings.Split(steps[s].Allow, ",") {
+			for _, a := range strings.Split(configuredAllow(s), ",") {
 				if p, ok := strings.CutPrefix(a, "Bash("); ok && strings.HasPrefix(strings.ToLower(cmd), strings.TrimSuffix(p, ":*)")) {
 					allowed = true
 				}
@@ -264,6 +267,7 @@ func TestAgentStepsHaveSchemaAndPrompt(t *testing.T) {
 
 // A stopped (or timed-out) session takes its child processes with it.
 func TestAgentKillsProcessGroup(t *testing.T) {
+	useProfile(t, defaultProfile("claude"))
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "pid")
 	os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\nsleep 300 &\necho $! > "+pidFile+"\nwait\n"), 0o755)
@@ -329,6 +333,9 @@ func TestPickSubIssues(t *testing.T) {
 
 // A leftover worktree is kept unless the job says to discard it; discard also drops the branch.
 func TestWorktreeDiscard(t *testing.T) {
+	p := defaultProfile("copilot")
+	p.Base = "main"
+	useProfile(t, p)
 	repo := filepath.Join(t.TempDir(), "repo")
 	os.MkdirAll(repo, 0o755)
 	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"}} {
@@ -367,6 +374,9 @@ func TestWorktreeDiscard(t *testing.T) {
 
 // No agent step may fall back to the CLI's default model, and the page's choice reaches the run.
 func TestModelDefaultsAndChoice(t *testing.T) {
+	p := defaultProfile("claude")
+	p.Checks = []string{"true"}
+	useProfile(t, p)
 	for _, st := range steps {
 		if st.Role != "" && st.Model == "" {
 			t.Errorf("%s has no default model", st.Name)
@@ -376,6 +386,12 @@ func TestModelDefaultsAndChoice(t *testing.T) {
 		t.Errorf("agentModels = %v", m)
 	}
 	t.Setenv("SM_MODEL_PLAN", "claude-haiku-5-5")
+	t.Setenv("SM_CHECKS", "true")
+	var err error
+	settings, err = loadProfile("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if m := agentModels()["plan"]; m != "claude-haiku-5-5" {
 		t.Errorf("SM_MODEL_PLAN not honoured: %q", m)
 	}

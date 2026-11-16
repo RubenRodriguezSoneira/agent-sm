@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -163,29 +165,34 @@ func serve(issue, addr, repo string) error {
 		}
 		return true
 	}
+	ctx, cancel := context.WithCancel(runCtx)
+	defer cancel()
+	var management *manager
+	if run != nil && settings.Management.Mode == "service" {
+		var err error
+		management, err = newManager(ctx, repo, settings)
+		if err != nil {
+			return err
+		}
+		go management.watch(ctx)
+	}
+	managementRoutes(mux, management, authed)
 	mux.HandleFunc("/api/run", func(w http.ResponseWriter, r *http.Request) {
 		if !authed(w, r) {
 			return
 		}
-		var req struct {
-			Issues  []int             `json:"issues"`
-			Publish string            `json:"publish"`
-			Audit   bool              `json:"audit"`
-			Budget  string            `json:"budget"`
-			Discard bool              `json:"discard"`
-			Models  map[string]string `json:"models"`
-		}
-		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req) != nil || len(req.Issues) == 0 || len(req.Issues) > 20 ||
+		var req runRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&req) != nil || decoder.Decode(new(any)) != io.EOF || len(req.Issues) == 0 || len(req.Issues) > 20 ||
 			(req.Publish != "" && req.Publish != levelPR) || (req.Budget != "" && !budgetRe.MatchString(req.Budget)) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		defaults := agentModels()
-		for state, m := range req.Models {
-			if _, ok := defaults[state]; !ok || !modelRe.MatchString(m) {
-				http.Error(w, "bad model for "+state, http.StatusBadRequest)
-				return
-			}
+		profile, err := queuedProfile(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		var jobs []Job
 		notes := []string{}
@@ -201,7 +208,8 @@ func serve(issue, addr, repo string) error {
 			for _, i := range list {
 				if !seen[i] {
 					seen[i] = true
-					jobs = append(jobs, Job{Issue: i, Publish: req.Publish, Audit: req.Audit, Budget: req.Budget, Discard: req.Discard, Models: req.Models})
+					jobs = append(jobs, Job{Issue: i, Publish: req.Publish, Audit: req.Audit, Budget: req.Budget,
+						Discard: req.Discard, Models: req.Models, Provider: profile.Provider, Profile: &profile})
 				}
 			}
 		}
@@ -247,7 +255,53 @@ func serve(issue, addr, repo string) error {
 		mode = "can start runs in " + repo
 	}
 	fmt.Fprintf(os.Stderr, "agent-sm: http://%s  (showing %s; %s; stats %s)\n", addr, what, mode, statsPath)
-	return http.ListenAndServe(addr, http.HandlerFunc(guard))
+	server := &http.Server{Addr: addr, Handler: http.HandlerFunc(guard), ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		stopCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		server.Shutdown(stopCtx)
+	}()
+	defer cancel()
+	return server.ListenAndServe()
+}
+
+type runRequest struct {
+	Issues   []int             `json:"issues"`
+	Publish  string            `json:"publish"`
+	Audit    bool              `json:"audit"`
+	Budget   string            `json:"budget"`
+	Discard  bool              `json:"discard"`
+	Models   map[string]string `json:"models"`
+	Provider string            `json:"provider"`
+}
+
+func queuedProfile(req runRequest) (Profile, error) {
+	if req.Provider != "" && req.Provider != settings.Provider {
+		return Profile{}, fmt.Errorf("provider differs from server profile; restart with the intended profile")
+	}
+	b, err := json.Marshal(settings)
+	if err != nil {
+		return Profile{}, err
+	}
+	var p Profile
+	if err := json.Unmarshal(b, &p); err != nil {
+		return p, err
+	}
+	if p.Models == nil {
+		p.Models = map[string]string{}
+	}
+	p.Audit = req.Audit
+	if req.Budget != "" {
+		p.SessionLimit, err = strconv.ParseFloat(req.Budget, 64)
+		if err != nil {
+			return p, fmt.Errorf("invalid session limit")
+		}
+	}
+	for state, model := range req.Models {
+		p.Models[state] = model
+	}
+	return p, p.validate()
 }
 
 // oldWork names the jobs whose issue still has a worktree from an earlier run, as "#1, #2".

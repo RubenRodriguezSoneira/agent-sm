@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -55,16 +56,60 @@ func pickSubIssues(parent int, subs []subIssue, isOpen func(int) bool) (run []in
 }
 
 // expand asks GitHub for an issue's sub-issues and applies pickSubIssues.
-// shortcut: the first 100 sub-issues only; page the request if an epic ever has more.
 func expand(repo string, n int) ([]int, []string) {
-	out, err := sh(repo, "gh", "api", fmt.Sprintf("repos/{owner}/{repo}/issues/%d/sub_issues?per_page=100", n), "--jq",
-		`[.[] | {number, state, body: (.body // ""), blocked: (.issue_dependencies_summary.blocked_by // 0), subs: (.sub_issues_summary.total // 0)}]`)
+	out, err := sh(repo, "gh", "api", fmt.Sprintf("repos/{owner}/{repo}/issues/%d/sub_issues?per_page=100", n), "--paginate", "--slurp", "--jq",
+		`[.[][] | {number, state, body: (.body // ""), blocked: (.issue_dependencies_summary.blocked_by // 0), subs: (.sub_issues_summary.total // 0)}]`)
 	var subs []subIssue
 	if err != nil || json.Unmarshal([]byte(out), &subs) != nil {
 		return nil, []string{fmt.Sprintf("#%d not queued: cannot read its sub-issues: %s", n, tail(strings.TrimSpace(out), 200))}
 	}
+	if settings.Management.Mode == "service" {
+		if len(subs) == 0 {
+			if err := managedDependencies(runCtx, repo, n); err != nil {
+				return nil, []string{fmt.Sprintf("#%d not queued: %v", n, err)}
+			}
+		}
+		var filtered []subIssue
+		var notes []string
+		for _, s := range subs {
+			if s.State != "open" {
+				continue
+			}
+			if err := managedDependencies(runCtx, repo, s.Number); err != nil {
+				notes = append(notes, fmt.Sprintf("#%d not queued: %v", s.Number, err))
+			} else {
+				filtered = append(filtered, s)
+			}
+		}
+		if len(subs) > 0 && len(filtered) == 0 {
+			return nil, append(notes, fmt.Sprintf("#%d: no sub-issue can run now", n))
+		}
+		subs = filtered
+		run, why := pickSubIssues(n, subs, func(d int) bool {
+			st, err := sh(repo, "gh", "issue", "view", strconv.Itoa(d), "--json", "state", "--jq", ".state")
+			return err != nil || strings.TrimSpace(st) != "CLOSED"
+		})
+		return run, append(notes, why...)
+	}
 	return pickSubIssues(n, subs, func(d int) bool {
-		st, _ := sh(repo, "gh", "issue", "view", strconv.Itoa(d), "--json", "state", "--jq", ".state")
-		return strings.TrimSpace(st) == "OPEN"
+		st, err := sh(repo, "gh", "issue", "view", strconv.Itoa(d), "--json", "state", "--jq", ".state")
+		return err != nil || strings.TrimSpace(st) != "CLOSED"
 	})
+}
+
+func managedDependencies(ctx context.Context, repo string, n int) error {
+	m, err := newManager(ctx, repo, settings)
+	if err != nil {
+		return err
+	}
+	blockers, err := ghPages[issueSnapshot](ctx, m, m.endpoint(n, "/dependencies/blocked_by"))
+	if err != nil {
+		return fmt.Errorf("dependency state unavailable: %w", err)
+	}
+	for _, blocker := range blockers {
+		if blocker.State != "closed" {
+			return fmt.Errorf("blocked by open or unknown dependency %s", blocker.URL)
+		}
+	}
+	return nil
 }
