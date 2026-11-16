@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -95,6 +96,16 @@ func TestDependencies(t *testing.T) {
 	}
 	if d := dependencies("## Depends on\n- **Depends on:** #12\n- note #3"); len(d) != 1 || d[0] != 12 {
 		t.Errorf("depends-on line = %v, want [12]", d)
+	}
+	body := "## Dependencies\nSibling `depends_on`: `[]`.\n\n" +
+		"Story gates remain #54 -> #21/#22 -> #23 -> #24.\n" +
+		"See #20's checkpoint; this does not depend on #99.\n\n" +
+		"## Branching\n- Base branch: `feature` (parent Story #21)."
+	if d := dependencies(body); len(d) != 0 {
+		t.Errorf("contextual references became blockers: %v", d)
+	}
+	if d := dependencies("## Dependencies\n**Depends on:** #12\nBlocked by #13\n1. #14\n+ #15"); !slices.Equal(d, []int{12, 13, 14, 15}) {
+		t.Errorf("explicit entries = %v, want [12 13 14 15]", d)
 	}
 }
 
@@ -221,6 +232,9 @@ func TestReviewDiffIsNeverCut(t *testing.T) {
 // shortcut: the commands are listed here by hand (prompts are prose); the test fails if one
 // leaves the prompt, so the list cannot rot, but a new command in a prompt must be added here.
 func TestPromptCommandsAreAllowed(t *testing.T) {
+	p := defaultProfile("claude")
+	p.Legacy = true
+	useProfile(t, p)
 	named := map[State][]string{
 		Plan:        {"gh issue view"},
 		Investigate: {"ghidra", "grep", "~/venvs/desmume/bin/python", "Export JAVA_HOME"},
@@ -234,7 +248,7 @@ func TestPromptCommandsAreAllowed(t *testing.T) {
 				t.Errorf("%v: %q is no longer in the prompt; update this test", s, cmd)
 			}
 			allowed := false
-			for _, a := range strings.Split(steps[s].Allow, ",") {
+			for _, a := range strings.Split(configuredAllow(s), ",") {
 				if p, ok := strings.CutPrefix(a, "Bash("); ok && strings.HasPrefix(strings.ToLower(cmd), strings.TrimSuffix(p, ":*)")) {
 					allowed = true
 				}
@@ -264,6 +278,7 @@ func TestAgentStepsHaveSchemaAndPrompt(t *testing.T) {
 
 // A stopped (or timed-out) session takes its child processes with it.
 func TestAgentKillsProcessGroup(t *testing.T) {
+	useProfile(t, defaultProfile("claude"))
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "pid")
 	os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\nsleep 300 &\necho $! > "+pidFile+"\nwait\n"), 0o755)
@@ -327,46 +342,344 @@ func TestPickSubIssues(t *testing.T) {
 	}
 }
 
-// A leftover worktree is kept unless the job says to discard it; discard also drops the branch.
-func TestWorktreeDiscard(t *testing.T) {
-	repo := filepath.Join(t.TempDir(), "repo")
-	os.MkdirAll(repo, 0o755)
-	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"}} {
-		if out, err := sh(repo, "git", args...); err != nil {
-			t.Fatalf("git %v: %s", args, out)
+func TestExpandSubIssues(t *testing.T) {
+	useProfile(t, defaultProfile("copilot"))
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "gh"), `#!/bin/sh
+case "$1" in
+api)
+  for arg in "$@"; do
+    case "$arg" in
+      --paginate) paginate=1;;
+      --slurp) slurp=1;;
+      --jq) jq=1;;
+    esac
+  done
+  if [ "$slurp" = 1 ] && [ "$jq" = 1 ]; then
+    printf '%s\n\n' 'the --slurp option is not supported with --jq' >&2
+    printf '%0220d\n' 0 >&2
+    exit 1
+  fi
+  case "$SM_TEST_GH" in
+    empty) printf '%s\n' '[]';;
+    pages)
+      printf '%s\n' '[{"number":11,"state":"open"},{"number":12,"state":"open","blocked":1},{"number":13,"state":"closed"}]'
+      if [ "$paginate" = 1 ]; then
+        printf '%s\n' '[{"number":14,"state":"open","body":"## Dependencies\n- #7"},{"number":15,"state":"open","subs":2},{"number":16,"state":"open","body":"## Dependencies\n- #8"}]'
+      fi;;
+    error)
+      printf '%s\n\n' 'gh: API rate limit exceeded' >&2
+      printf '%0220d\n' 0 >&2
+      exit 1;;
+    partial-error)
+      printf '%s\n' '[{"number":11,"state":"open"}]'
+      printf '%s\n' 'gh: permission denied' >&2
+      exit 1;;
+    malformed) printf '[]\n{';;
+    empty-output) :;;
+    null) printf 'null\n';;
+    *) exit 2;;
+  esac;;
+issue)
+  case "$3" in
+    7) printf 'OPEN\n';;
+    8) printf 'CLOSED\n';;
+    *) exit 2;;
+  esac;;
+*) exit 2;;
+esac
+`, 0o755)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, tc := range []struct {
+		name  string
+		run   []int
+		notes []string
+	}{
+		{"empty", []int{10}, nil},
+		{"pages", []int{11, 16}, []string{"#12 skipped: blocked", "#14 skipped: depends on #7", "#15 skipped: has its own"}},
+		{"error", nil, []string{"#10 not queued: cannot read its sub-issues: gh: API rate limit exceeded"}},
+		{"partial-error", nil, []string{"gh: permission denied"}},
+		{"malformed", nil, []string{"#10 not queued: cannot read its sub-issues:"}},
+		{"empty-output", nil, []string{"#10 not queued: cannot read its sub-issues:"}},
+		{"null", nil, []string{"#10 not queued: cannot read its sub-issues:"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SM_TEST_GH", tc.name)
+			run, notes := expand(dir, 10)
+			if !slices.Equal(run, tc.run) {
+				t.Errorf("run = %v, want %v", run, tc.run)
+			}
+			if len(notes) != len(tc.notes) {
+				t.Errorf("notes = %v, want %v", notes, tc.notes)
+			}
+			for _, want := range tc.notes {
+				if !strings.Contains(strings.Join(notes, "\n"), want) {
+					t.Errorf("notes = %v, want %q", notes, want)
+				}
+			}
+		})
+	}
+	t.Run("missing gh", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		run, notes := expand(dir, 10)
+		if len(run) != 0 || len(notes) != 1 || !strings.Contains(notes[0], `exec: "gh"`) {
+			t.Fatalf("run = %v, notes = %v", run, notes)
+		}
+	})
+}
+
+func TestGitHubDependencies(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "gh"), `#!/bin/sh
+printf '%s\n' "$SM_TEST_BLOCKERS"
+exit "$SM_TEST_BLOCKERS_EXIT"
+`, 0o755)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, tc := range []struct {
+		name, response, exit, want string
+	}{
+		{"none", "[]", "0", ""},
+		{"closed", `[{"number":7,"state":"closed"}]`, "0", ""},
+		{"later page blocked", "[{\"number\":7,\"state\":\"closed\"}]\n[{\"number\":8,\"state\":\"open\"}]", "0", "dependency #8"},
+		{"unavailable", "permission denied", "1", "cannot read GitHub blockers"},
+		{"incomplete", "[]\n{", "0", "invalid GitHub blockers"},
+		{"null", "null", "0", "invalid GitHub blockers"},
+		{"invalid identity", "[null]", "0", "invalid GitHub blocker identity"},
+		{"unknown state", `[{"number":7}]`, "0", "invalid GitHub blocker identity or state"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SM_TEST_BLOCKERS", tc.response)
+			t.Setenv("SM_TEST_BLOCKERS_EXIT", tc.exit)
+			err := githubDependencies(dir, 10)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func testGit(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	out, err := sh(repo, "git", args...)
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return strings.TrimSpace(out)
+}
+
+func retryRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	testGit(t, dir, "init", "-q", "-b", "main", repo)
+	testGit(t, repo, "config", "user.name", "test")
+	testGit(t, repo, "config", "user.email", "test@example.com")
+	testGit(t, repo, "commit", "-q", "--allow-empty", "-m", "base")
+	remote := filepath.Join(dir, "remote.git")
+	testGit(t, dir, "init", "-q", "--bare", remote)
+	testGit(t, repo, "remote", "add", "origin", remote)
+	testGit(t, repo, "push", "-q", "origin", "main")
+	writeFile(t, filepath.Join(dir, "gh"), `#!/bin/sh
+if [ -n "$SM_TEST_GH_ARGS" ]; then printf '%s\n' "$@" >> "$SM_TEST_GH_ARGS"; fi
+case "$1 $2" in
+  "pr list")
+    if [ "$SM_TEST_PR_ERROR" = 1 ]; then echo 'PR lookup failed' >&2; exit 1; fi
+    if [ -n "$SM_TEST_PR_RESPONSE" ]; then printf '%s\n' "$SM_TEST_PR_RESPONSE"; exit; fi
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--head" ]; then shift; head="$1"; fi
+      shift
+    done
+    if [ "$head" = "$SM_TEST_PR_BRANCH" ]; then echo '[{"number":42}]'; else echo '[]'; fi;;
+  "pr create") echo 'https://github.com/example/repo/pull/42';;
+  "pr comment") :;;
+  *) exit 1;;
+esac
+`, 0o755)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return repo
+}
+
+func TestWorktreeRetry(t *testing.T) {
+	repo := retryRepo(t)
+	r := &Runner{repo: repo}
+	dir, branch, err := r.worktreeAt(5, "main")
+	if err != nil || branch != "sm/issue-5" || filepath.Base(dir) != "5-sm" {
+		t.Fatalf("first attempt: %s %s %v", dir, branch, err)
+	}
+	writeFile(t, filepath.Join(dir, "committed.txt"), "old commit", 0o644)
+	testGit(t, dir, "add", "-A")
+	testGit(t, dir, "commit", "-qm", "old attempt")
+	oldHead := testGit(t, dir, "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(dir, "staged.txt"), "old staged work", 0o644)
+	testGit(t, dir, "add", "staged.txt")
+	writeFile(t, filepath.Join(dir, "untracked.txt"), "old untracked work", 0o644)
+	testGit(t, repo, "branch", "sm/issue-5-10", "main")
+
+	fresh, branch, err := r.worktreeAt(5, "main")
+	if err != nil || branch != "sm/issue-5-1" || filepath.Base(fresh) != "5-sm-1" {
+		t.Fatalf("retry: %s %s %v", fresh, branch, err)
+	}
+	if testGit(t, fresh, "rev-parse", "HEAD") != testGit(t, repo, "rev-parse", "main") {
+		t.Fatal("retry inherited the old attempt instead of the configured base")
+	}
+	for _, file := range []string{"committed.txt", "staged.txt", "untracked.txt"} {
+		if _, err := os.Stat(filepath.Join(fresh, file)); !os.IsNotExist(err) {
+			t.Errorf("retry inherited %s", file)
+		}
+		if _, err := os.Stat(filepath.Join(dir, file)); err != nil {
+			t.Errorf("old work lost %s: %v", file, err)
 		}
 	}
-	t.Setenv("SM_BASE", "main")
+	if testGit(t, dir, "rev-parse", "HEAD") != oldHead || testGit(t, dir, "diff", "--cached", "--name-only") != "staged.txt" {
+		t.Fatal("old branch or index changed")
+	}
+	testGit(t, repo, "branch", "sm/issue-5-2", "main")
+	occupied := filepath.Join(r.worktreeRoot(), "5-sm-3")
+	if err := os.Mkdir(occupied, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(occupied, "keep.txt"), "keep", 0o644)
+	testGit(t, repo, "push", "-q", "origin", "main:refs/heads/sm/issue-5-4")
+	t.Setenv("SM_TEST_PR_BRANCH", "sm/issue-5-5")
+	next, branch, err := r.worktreeAt(5, "main")
+	if err != nil || branch != "sm/issue-5-6" || filepath.Base(next) != "5-sm-6" {
+		t.Fatalf("mixed collisions: %s %s %v", next, branch, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(occupied, "keep.txt")); err != nil || string(b) != "keep" {
+		t.Fatal("occupied directory was changed")
+	}
+	if got := r.leftovers(); !slices.Equal(got, []int{5}) {
+		t.Errorf("leftovers = %v", got)
+	}
+}
+
+func TestRegisteredWorktreeRetry(t *testing.T) {
+	repo := retryRepo(t)
 	r := &Runner{repo: repo}
-	dir, err := r.worktree(5, false)
+	old := filepath.Join(r.worktreeRoot(), "5-sm")
+	testGit(t, repo, "worktree", "add", "--detach", old, "main")
+	if err := os.Rename(old, old+"-kept"); err != nil {
+		t.Fatal(err)
+	}
+	dir, branch, err := r.worktreeAt(5, "main")
+	if err != nil || branch != "sm/issue-5-1" || filepath.Base(dir) != "5-sm-1" {
+		t.Fatalf("registered collision: %s %s %v", dir, branch, err)
+	}
+}
+
+func TestRetryLookupFailsClosed(t *testing.T) {
+	for _, mode := range []string{"github unavailable", "invalid github response", "invalid PR identity", "remote unavailable"} {
+		t.Run(mode, func(t *testing.T) {
+			repo := retryRepo(t)
+			switch mode {
+			case "github unavailable":
+				t.Setenv("SM_TEST_PR_ERROR", "1")
+			case "invalid github response":
+				t.Setenv("SM_TEST_PR_RESPONSE", "null")
+			case "invalid PR identity":
+				t.Setenv("SM_TEST_PR_RESPONSE", "[null]")
+			case "remote unavailable":
+				testGit(t, repo, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "missing"))
+			}
+			r := &Runner{repo: repo}
+			if _, _, err := r.worktreeAt(5, "main"); err == nil {
+				t.Fatal("lookup failure was treated as a free name")
+			}
+			if got := testGit(t, repo, "for-each-ref", "--format=%(refname)", "refs/heads/sm"); got != "" {
+				t.Fatalf("lookup failure created a branch: %s", got)
+			}
+		})
+	}
+}
+
+func TestPublishRetryBranch(t *testing.T) {
+	p := defaultProfile("copilot")
+	p.Base, p.Checks = "main", []string{"true"}
+	useProfile(t, p)
+	repo := retryRepo(t)
+	r := &Runner{repo: repo}
+	old, _, err := r.worktreeAt(5, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sh(dir, "git", "checkout", "-q", "-b", "sm/issue-5")
-	os.WriteFile(filepath.Join(dir, "work.txt"), []byte("staged result"), 0o644)
-	sh(dir, "git", "add", "-A")
-	if l := r.leftovers(); len(l) != 1 || l[0] != 5 {
-		t.Errorf("leftovers = %v, want [5]", l)
+	writeFile(t, filepath.Join(old, "old.txt"), "keep staged", 0o644)
+	testGit(t, old, "add", "-A")
+	dir, branch, err := r.worktreeAt(5, "main")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := r.worktree(5, false); err == nil {
-		t.Fatal("an existing worktree must not be reused or removed without discard")
+	writeFile(t, filepath.Join(dir, "new.txt"), "new attempt", 0o644)
+	testGit(t, dir, "add", "-A")
+	args := filepath.Join(t.TempDir(), "gh-args")
+	t.Setenv("SM_TEST_GH_ARGS", args)
+	c := &Ctx{Repo: dir, Issue: 5, Branch: branch, Base: "main", Level: levelPR, Title: "task", ClosesIssue: true}
+	if got := publish(c); got != Ok {
+		t.Fatalf("publish = %v", got)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "work.txt")); err != nil {
-		t.Fatal("the refused run must leave the old work in place")
+	if got := testGit(t, repo, "ls-remote", "--heads", "origin", "refs/heads/"+branch); !strings.Contains(got, "refs/heads/sm/issue-5-1") {
+		t.Fatalf("retry branch was not pushed: %s", got)
 	}
-	if _, err := r.worktree(5, true); err != nil {
-		t.Fatalf("discard: %v", err)
+	b, err := os.ReadFile(args)
+	if err != nil || !strings.Contains(string(b), "--head\nsm/issue-5-1\n") {
+		t.Fatalf("PR did not use selected branch: %s %v", b, err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "work.txt")); err == nil {
-		t.Error("discard must give a fresh worktree")
+	c.Merged = true
+	cleanupWorktree(c)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("merged retry worktree was not cleaned up")
 	}
-	if _, err := sh(repo, "git", "rev-parse", "--verify", "-q", "refs/heads/sm/issue-5"); err == nil {
-		t.Error("discard must delete the old branch")
+	if got := testGit(t, repo, "for-each-ref", "--format=%(refname)", "refs/heads/"+branch); got != "" {
+		t.Fatalf("merged retry branch remains: %s", got)
+	}
+	if testGit(t, old, "diff", "--cached", "--name-only") != "old.txt" {
+		t.Fatal("cleanup changed the earlier attempt")
+	}
+}
+
+func TestPublishRetryRefusesCollisions(t *testing.T) {
+	p := defaultProfile("copilot")
+	p.Base, p.Checks = "main", []string{"true"}
+	useProfile(t, p)
+	for _, mode := range []string{"remote collision", "changed branch"} {
+		t.Run(mode, func(t *testing.T) {
+			repo := retryRepo(t)
+			r := &Runner{repo: repo}
+			dir, branch, err := r.worktreeAt(5, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, filepath.Join(dir, "new.txt"), "candidate", 0o644)
+			testGit(t, dir, "add", "-A")
+			if mode == "remote collision" {
+				testGit(t, repo, "push", "-q", "origin", "main:refs/heads/"+branch)
+			} else {
+				testGit(t, dir, "checkout", "-qb", "another-branch")
+			}
+			head := testGit(t, dir, "rev-parse", "HEAD")
+			remote := testGit(t, repo, "ls-remote", "--heads", "origin", "refs/heads/"+branch)
+			c := &Ctx{Repo: dir, Issue: 5, Branch: branch, Base: "main", Level: levelPR, Title: "task"}
+			if publish(c) != Fail {
+				t.Fatal("publication accepted a conflicting branch")
+			}
+			if got := testGit(t, repo, "ls-remote", "--heads", "origin", "refs/heads/"+branch); got != remote {
+				t.Fatal("publication overwrote a remote branch")
+			}
+			if mode == "changed branch" && testGit(t, dir, "rev-parse", "HEAD") != head {
+				t.Fatal("publication committed on a different branch")
+			}
+		})
 	}
 }
 
 // No agent step may fall back to the CLI's default model, and the page's choice reaches the run.
 func TestModelDefaultsAndChoice(t *testing.T) {
+	p := defaultProfile("claude")
+	p.Checks = []string{"true"}
+	useProfile(t, p)
 	for _, st := range steps {
 		if st.Role != "" && st.Model == "" {
 			t.Errorf("%s has no default model", st.Name)
@@ -376,6 +689,12 @@ func TestModelDefaultsAndChoice(t *testing.T) {
 		t.Errorf("agentModels = %v", m)
 	}
 	t.Setenv("SM_MODEL_PLAN", "claude-haiku-5-5")
+	t.Setenv("SM_CHECKS", "true")
+	var err error
+	settings, err = loadProfile("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if m := agentModels()["plan"]; m != "claude-haiku-5-5" {
 		t.Errorf("SM_MODEL_PLAN not honoured: %q", m)
 	}
@@ -388,15 +707,5 @@ func TestModelDefaultsAndChoice(t *testing.T) {
 	}
 	if last != "SM_MODEL_PLAN=claude-opus-5-5" {
 		t.Errorf("the page's model must win over the server's environment, got %q", last)
-	}
-}
-
-func TestOldWork(t *testing.T) {
-	jobs := []Job{{Issue: 1}, {Issue: 424}, {Issue: 7}}
-	if got := oldWork(jobs, []int{7, 424, 99}); got != "#424, #7" {
-		t.Fatalf("got %q", got)
-	}
-	if got := oldWork(jobs, nil); got != "" {
-		t.Fatalf("got %q", got)
 	}
 }

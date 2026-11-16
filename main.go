@@ -11,6 +11,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -21,14 +22,22 @@ import (
 	"time"
 )
 
-//go:embed prompts/*.md
+//go:embed prompts/*.md prompts/generic/*.md
 var promptFS embed.FS
 
 // rolePrompt is the RTK rule followed by the step's role prompt (prompts/*.md).
 func rolePrompt(s State) string {
 	rtk, _ := promptFS.ReadFile("prompts/rtk.md")
-	role, _ := promptFS.ReadFile("prompts/" + steps[s].Role + ".md")
-	return string(rtk) + "\n\n" + string(role)
+	dir := "prompts/generic/"
+	if settings.Legacy {
+		dir = "prompts/"
+	}
+	role, _ := promptFS.ReadFile(dir + steps[s].Role + ".md")
+	text := string(rtk) + "\n\n" + string(role)
+	if settings.Management.Mode == "service" {
+		text += "\n\nThe service supplies tracker context and owns all GitHub/Jira operations. Do not run tracker commands or skills. Only when decomposition is needed, you may include an issue_plan matching the supplied result schema; it is an unapproved proposal, never an instruction to apply changes."
+	}
+	return text
 }
 
 // Unit is one investigation session's share of the work.
@@ -116,10 +125,7 @@ const (
 
 // stepModel is the model a step runs on: SM_MODEL_<STATE> if set, else the step's default.
 func stepModel(st Step) string {
-	if v := os.Getenv("SM_MODEL_" + strings.ToUpper(st.Name)); v != "" {
-		return v
-	}
-	return st.Model
+	return settings.model(st)
 }
 
 var steps [numStates]Step
@@ -134,19 +140,26 @@ func init() { // not a composite literal at package level: the step functions re
 		Investigate: {Name: "investigate", Run: investigate, Outs: []Out{Ok, More, Blocked, Split, Invalid, Timeout, OverBudget},
 			Role: "investigator", Model: sonnet,
 			Schema: `{"type":"object","properties":{"status":{"enum":["evidence","blocked"]},"evidence":{"type":"string"},"handoff":{"type":"string"},"fits_one_pr":{"type":"boolean"}},"required":["status","evidence","handoff","fits_one_pr"],"additionalProperties":false}`,
-			Allow:  "Read,Grep,Glob," + shRead + "," + shProbe + ",Bash(ghidra:*),Bash(git log:*),Bash(git grep:*),Bash(git status:*),Bash(gh issue view:*),Bash(cp:*),Bash(sleep:*)"},
+			Allow:  "Read,Grep,Glob," + shRead + ",Bash(git log:*),Bash(git grep:*),Bash(git status:*),Bash(gh issue view:*)"},
 		Execute: {Name: "execute", Run: execute, Outs: []Out{Ok, Blocked, Invalid, Timeout, OverBudget},
 			Role: "executor", Model: sonnet,
 			Schema: `{"type":"object","properties":{"status":{"enum":["done","partial","blocked"]},"summary":{"type":"string"},"closes_issue":{"type":"boolean"}},"required":["status","summary","closes_issue"],"additionalProperties":false}`,
-			Allow:  "Read,Grep,Glob,Edit,Write," + shRead + "," + shProbe + ",Bash(cargo:*),Bash(scripts/check-deps.sh:*),Bash(./scripts/check-deps.sh:*),Bash(git diff:*),Bash(git status:*)",
+			Allow:  "Read,Grep,Glob,Edit,Write," + shRead + ",Bash(git diff:*),Bash(git status:*)",
 			Edit:   true},
 		Check: {Name: "check", Run: check, Outs: []Out{Pass, Fail}},
 		Review: {Name: "review", Run: review, Outs: []Out{Pass, Fail, Split, Escalate, Invalid, Timeout, OverBudget},
 			Role: "reviewer", Model: opus,
 			Schema: `{"type":"object","properties":{"verdict":{"enum":["PASS","REVISE","SPLIT","ESCALATE"]},"reasons":{"type":"array","items":{"type":"string"}}},"required":["verdict","reasons"],"additionalProperties":false}`,
-			Allow:  "Read,Grep,Glob," + shRead + "," + shProbe + ",Bash(git diff:*),Bash(git log:*),Bash(ghidra:*)"},
+			Allow:  "Read,Grep,Glob," + shRead + ",Bash(git diff:*),Bash(git log:*)"},
 		Publish: {Name: "publish", Run: publish, Outs: []Out{Ok, Fail}},
 	}
+	var schema map[string]any
+	var proposal map[string]any
+	json.Unmarshal([]byte(steps[Plan].Schema), &schema)
+	json.Unmarshal([]byte(workPlanSchema), &proposal)
+	schema["properties"].(map[string]any)["issue_plan"] = proposal
+	b, _ := json.Marshal(schema)
+	steps[Plan].Schema = string(b)
 }
 
 const (
@@ -247,35 +260,41 @@ func next(s State, o Out, visits [numStates]int) Next {
 
 // Ctx is the typed data steps pass to each other.
 type Ctx struct {
-	Repo          string
-	Issue         int
-	Title         string
-	Body          string
-	Evidence      string // investigate -> execute
-	Feedback      string // check/review failure -> next execute
-	Diff          string // check -> review
-	Summary       string // execute -> review
-	Scratch       string // outside the repo
-	Ghidra        string // ghidra project copy, or "none"
-	Level         string // SM_PUBLISH: "", "pr" or "merge"
-	Model         string // executor model id, for the commit trailer
-	Verdict       string // reviewer reasons
-	ClosesIssue   bool   // executor: every Done-when item met
-	Rounds        int    // execute runs so far
-	Objective     string // plan -> everyone
-	Points        []string
-	PointsDerived bool     // the planner derived the points; publish posts them on the issue
-	Files         []string // plan -> check (scope gate), execute, review
-	Verification  string
-	Merged        bool   // publish merged the PR
-	Units         []Unit // plan -> investigate: one session per unit, each sized for about 30 minutes
-	UnitIdx       int
-	Handoff       string // notes earlier units leave for later ones
-	BlockedUnits  int
-	Cost          float64 // known cost so far; killed sessions report none, see CostUnknown
-	CostUnknown   int     // sessions killed before they reported a cost
-	RunBudget     float64 // SM_RUN_BUDGET: the run starts no step once Cost reaches it; 0 is no limit
-	Export        string  // prepare -> dispatch: whether the Ghidra export is usable, with its STAMP
+	Repo            string
+	Issue           int
+	Title           string
+	Body            string
+	Evidence        string // investigate -> execute
+	Feedback        string // check/review failure -> next execute
+	Diff            string // check -> review
+	Summary         string // execute -> review
+	Scratch         string // outside the repo
+	Ghidra          string // ghidra project copy, or "none"
+	Level           string // SM_PUBLISH: "", "pr" or "merge"
+	Verdict         string // reviewer reasons
+	ClosesIssue     bool   // executor: every Done-when item met
+	Rounds          int    // execute runs so far
+	Objective       string // plan -> everyone
+	Points          []string
+	PointsDerived   bool     // the planner derived the points; publish posts them on the issue
+	Files           []string // plan -> check (scope gate), execute, review
+	Verification    string
+	Merged          bool   // publish merged the PR
+	Units           []Unit // plan -> investigate: one session per unit, each sized for about 30 minutes
+	UnitIdx         int
+	Handoff         string // notes earlier units leave for later ones
+	BlockedUnits    int
+	Cost            float64 // known native usage: Claude USD or Copilot credits
+	CostUnknown     int     // sessions without complete native usage
+	RunBudget       float64 // native SM_RUN_LIMIT; 0 disables the run limit
+	Export          string  // prepare -> dispatch: whether the Ghidra export is usable, with its STAMP
+	Base            string
+	Branch          string
+	IssueURL        string
+	JiraKey         string
+	Proposal        *WorkPlan
+	ManagementError string
+	Comments        string
 }
 
 // runCtx is cancelled by SIGINT or SIGTERM (set in main); agent sessions end with it.
@@ -295,6 +314,9 @@ func logEvent(kv map[string]any) {
 
 func sh(dir, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
+	if name == "gh" && settings.Management.Mode == "service" {
+		cmd.Env = serviceEnv()
+	}
 	cmd.Dir = dir
 	var buf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &buf, &buf
@@ -312,6 +334,9 @@ func tail(s string, n int) string {
 // Stats is one agent session's measurements, appended as a JSON line to SM_STATS
 // (default agent-sm-stats.jsonl) and echoed in the step log.
 type Stats struct {
+	Provider      string         `json:"provider,omitempty"`
+	UsageUnknown  bool           `json:"usage_unknown,omitempty"`
+	Credits       *float64       `json:"credits,omitempty"`
 	Issue         int            `json:"issue"`
 	State         string         `json:"state"`
 	SessionID     string         `json:"session_id"`
@@ -324,7 +349,7 @@ type Stats struct {
 	DeniedSample  []string       `json:"denied_sample"` // first few attempts, truncated
 	Turns         int            `json:"turns"`
 	DurationMs    int            `json:"duration_ms"`
-	CostUSD       float64        `json:"cost_usd"`
+	CostUSD       float64        `json:"cost_usd,omitempty"`
 	InputTokens   int            `json:"input_tokens"`
 	OutputTokens  int            `json:"output_tokens"`
 	CacheCreation int            `json:"cache_creation_tokens"`
@@ -363,32 +388,19 @@ func builtin(allow string) string {
 	return strings.Join(names, ",")
 }
 
-// agent runs one `claude -p` session and decodes its schema-checked result into out.
+// claudeAgent runs one `claude -p` session and validates its structured result.
 // allow is the tool allow list; only those built-in tools are loaded and no MCP servers,
 // skills or hooks, to keep the cached prefix small. It returns Ok, or why there is no result:
 // Invalid (missing or off-schema output), Timeout or OverBudget.
-func agent(c *Ctx, state State, prompt string, out any) (res Out) {
+func claudeAgent(c *Ctx, state State, prompt string, out any, transcript *agentTranscript) (res Out) {
 	step := steps[state]
-	minutes := 60 // SM_TIMEOUT overrides, in minutes
-	if v, err := strconv.Atoi(os.Getenv("SM_TIMEOUT")); err == nil && v > 0 {
-		minutes = v
-	}
-	ctx, cancel := context.WithTimeout(runCtx, time.Duration(minutes)*time.Minute)
+	ctx, cancel := context.WithTimeout(runCtx, time.Duration(settings.TimeoutMinutes*float64(time.Minute)))
 	defer cancel()
-	budget := 2.0
-	if v, err := strconv.ParseFloat(os.Getenv("SM_BUDGET"), 64); err == nil && v > 0 {
-		budget = v
-	}
+	budget := settings.SessionLimit
 	if c.RunBudget > 0 { // a session may not spend more than the run has left
 		budget = min(budget, c.RunBudget-c.Cost)
 	}
-	// shortcut: per-run env overrides instead of per-repo config. SM_EXTRA_ALLOW adds allow
-	// entries to every agent; SM_ADD_DIRS (comma separated) lets them read outside the repo.
-	allow := allowFor(state, step.Allow)
-	if x := os.Getenv("SM_EXTRA_ALLOW"); x != "" {
-		allow += "," + x
-	}
-	allow = withRTK(allow)
+	allow := configuredAllow(state)
 	args := []string{"-p", prompt, "--output-format", "stream-json", "--verbose", "--json-schema", step.Schema,
 		"--no-session-persistence", "--allowedTools", allow, "--max-budget-usd", strconv.FormatFloat(budget, 'f', 4, 64),
 		"--append-system-prompt", rolePrompt(state)}
@@ -398,8 +410,17 @@ func agent(c *Ctx, state State, prompt string, out any) (res Out) {
 	// SM_AUDIT=1: every built-in tool is listed and permissions are bypassed, so `agent-sm stats`
 	// can show what each state really uses. Outward commands stay denied (auditDeny), MCP servers
 	// and skills stay off. Normal runs load only the allow list.
-	audit := os.Getenv("SM_AUDIT") != ""
+	audit := settings.Audit
 	args = append(args, "--strict-mcp-config", "--disable-slash-commands")
+	if settings.Management.Mode == "service" {
+		var denied []string
+		for _, prefix := range []string{"gh", "curl", "wget"} {
+			for _, wrapper := range []string{"", "rtk ", "rtk proxy "} {
+				denied = append(denied, "Bash("+wrapper+prefix+":*)")
+			}
+		}
+		args = append(args, "--disallowedTools", strings.Join(denied, ","))
+	}
 	if audit {
 		deny := auditDeny
 		if state != Execute {
@@ -412,16 +433,24 @@ func agent(c *Ctx, state State, prompt string, out any) (res Out) {
 			args = append(args, "--permission-mode", "acceptEdits")
 		}
 	}
-	for _, d := range strings.Split(os.Getenv("SM_ADD_DIRS"), ",") {
+	for _, d := range settings.AddDirs {
 		if d != "" {
 			args = append(args, "--add-dir", d)
 		}
 	}
-	cmd := exec.CommandContext(ctx, "claude", args...)
-	cmd.Dir = c.Repo
-	// Its own process group, killed whole on timeout or stop, so probes and the Ghidra bridge go too.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	if transcript != nil {
+		if err := transcript.request(args, state, cancel); err != nil {
+			logEvent(map[string]any{"event": "transcript-error", "err": err.Error()})
+			return Invalid
+		}
+	}
+	cmd := process(ctx, c.Repo, "claude", args...)
+	cmd.Env = cleanAgentEnv()
+	diagnostics := &boundedOutput{limit: 64 << 10}
+	cmd.Stderr = diagnostics
+	if transcript != nil {
+		cmd.Stderr = io.MultiWriter(transcript.stderr, diagnostics)
+	}
 	stdout, perr := cmd.StdoutPipe()
 	if perr == nil {
 		perr = cmd.Start()
@@ -431,14 +460,20 @@ func agent(c *Ctx, state State, prompt string, out any) (res Out) {
 		return Invalid
 	}
 
-	st := &Stats{Issue: c.Issue, State: state.String(), ToolCalls: map[string]int{}, BashCmds: map[string]int{}}
+	st := &Stats{Provider: "claude", Issue: c.Issue, State: state.String(), ToolCalls: map[string]int{}, BashCmds: map[string]int{}}
 	if state == Investigate && len(c.Units) > 0 {
 		st.Unit = c.Units[c.UnitIdx].ID
 	}
 	prog := &progress{c: c, state: state, unit: st.Unit, start: time.Now()}
 	var structured json.RawMessage
+	results := 0
+	usageReported := false
 	isErr, subtype := true, ""
-	sc := bufio.NewScanner(stdout)
+	var reader io.Reader = stdout
+	if transcript != nil {
+		reader = io.TeeReader(stdout, transcript.stdout)
+	}
+	sc := bufio.NewScanner(reader)
 	sc.Buffer(make([]byte, 1<<20), 64<<20)
 	for sc.Scan() {
 		line := sc.Bytes()
@@ -460,10 +495,10 @@ func agent(c *Ctx, state State, prompt string, out any) (res Out) {
 					Input   json.RawMessage `json:"input"`
 				} `json:"content"`
 			} `json:"message"`
-			IsError bool    `json:"is_error"`
-			Turns   int     `json:"num_turns"`
-			Dur     int     `json:"duration_ms"`
-			Cost    float64 `json:"total_cost_usd"`
+			IsError bool     `json:"is_error"`
+			Turns   int      `json:"num_turns"`
+			Dur     int      `json:"duration_ms"`
+			Cost    *float64 `json:"total_cost_usd"`
 			Denied  []struct {
 				Tool  string          `json:"tool_name"`
 				Input json.RawMessage `json:"tool_input"`
@@ -509,8 +544,12 @@ func agent(c *Ctx, state State, prompt string, out any) (res Out) {
 				}
 			}
 		case ev.Type == "result":
+			results++
 			isErr, structured, subtype = ev.IsError, ev.Structured, ev.Subtype
-			st.Turns, st.DurationMs, st.CostUSD, st.Denials = ev.Turns, ev.Dur, ev.Cost, len(ev.Denied)
+			st.Turns, st.DurationMs, st.Denials = ev.Turns, ev.Dur, len(ev.Denied)
+			if ev.Cost != nil && finiteNonnegative(*ev.Cost) {
+				st.CostUSD, usageReported = *ev.Cost, true
+			}
 			st.DeniedTools = map[string]int{}
 			for _, d := range ev.Denied {
 				st.DeniedTools[d.Tool]++
@@ -522,15 +561,20 @@ func agent(c *Ctx, state State, prompt string, out any) (res Out) {
 			st.CacheCreation, st.CacheRead = ev.RawUsage.Create, ev.RawUsage.Read
 		}
 	}
+	if sc.Err() != nil {
+		cancel()
+	}
 	runErr := cmd.Wait()
+	if err := sc.Err(); err != nil {
+		logEvent(map[string]any{"event": "agent-error", "err": err.Error()})
+		runErr = err
+	}
 	st.Killed = ctx.Err() != nil && len(structured) == 0
 	prog.flush(true)
 	c.Cost += st.CostUSD
-	if st.Killed {
+	st.UsageUnknown = results != 1 || !usageReported
+	if st.UsageUnknown {
 		c.CostUnknown++
-	}
-	if state == Execute && st.Model != "" {
-		c.Model = st.Model
 	}
 	defer func() {
 		st.Outcome, st.OK = res.String(), res == Ok
@@ -538,23 +582,22 @@ func agent(c *Ctx, state State, prompt string, out any) (res Out) {
 		logEvent(map[string]any{"event": "agent", "stats": st})
 	}()
 	if runErr != nil && len(structured) == 0 {
-		logEvent(map[string]any{"event": "agent-error", "err": runErr.Error()})
+		logEvent(map[string]any{"event": "agent-error", "err": runErr.Error(), "stderr": tail(diagnostics.String(), 1500)})
 	}
 	switch {
 	case subtype == "error_max_budget_usd":
 		return OverBudget
 	case ctx.Err() == context.DeadlineExceeded && len(structured) == 0:
 		return Timeout
-	case isErr || len(structured) == 0:
+	case runErr != nil || isErr || results != 1 || len(structured) == 0:
 		return Invalid
 	}
-	dec := json.NewDecoder(bytes.NewReader(structured))
-	dec.DisallowUnknownFields()
 	st.Result = string(structured)
 	if len(st.Result) > 1500 {
 		st.Result = st.Result[:1500]
 	}
-	if dec.Decode(out) != nil {
+	if err := validateResult(structured, step.Schema, out); err != nil {
+		logEvent(map[string]any{"event": "invalid-result", "err": err.Error()})
 		return Invalid
 	}
 	return Ok
@@ -569,35 +612,85 @@ func prepare(c *Ctx) Out {
 		logEvent(map[string]any{"event": "prepare", "err": "working tree not clean"})
 		return Fail
 	}
-	out, err := sh(c.Repo, "gh", "issue", "view", strconv.Itoa(c.Issue), "--json", "title,body")
-	var iss struct{ Title, Body string }
+	out, err := sh(c.Repo, "gh", "issue", "view", strconv.Itoa(c.Issue), "--json", "title,body,url")
+	var iss struct{ Title, Body, URL string }
 	if err != nil || json.Unmarshal([]byte(out), &iss) != nil {
 		logEvent(map[string]any{"event": "prepare", "err": "gh issue view failed", "out": tail(out, 500)})
 		return Fail
 	}
 	c.Title, c.Body = iss.Title, iss.Body
+	c.IssueURL = iss.URL
+	meta, err := issueMetadata(c.Body)
+	if err != nil {
+		logEvent(map[string]any{"event": "prepare", "err": err.Error()})
+		return Fail
+	}
+	if c.Base != "" && meta.Base != "" && c.Base != meta.Base {
+		logEvent(map[string]any{"event": "prepare", "err": "issue base changed after worktree creation"})
+		return Fail
+	}
+	c.Base = settings.Base
+	if meta.Base != "" {
+		c.Base = meta.Base
+	}
+	c.JiraKey = meta.JiraKey
+	if c.Branch != "" {
+		if err := checkRunBranch(c); err != nil {
+			logEvent(map[string]any{"event": "prepare", "err": err.Error()})
+			return Fail
+		}
+	}
+	if settings.Jira.Mode == "actions" && c.JiraKey != "" {
+		result := reconcileJira(c)
+		logEvent(map[string]any{"event": "jira", "result": result})
+		if result.Status == "conflict" || result.Status == "blocked" {
+			return Fail
+		}
+	}
+	if settings.Management.Mode == "service" {
+		if err := manageRun(c, false, 0, "", false); err != nil {
+			return Fail
+		}
+		if err := managedDependencies(runCtx, c.Repo, c.Issue); err != nil {
+			logEvent(map[string]any{"event": "prepare", "err": err.Error()})
+			return Fail
+		}
+		if err := managementContext(c); err != nil {
+			logEvent(map[string]any{"event": "prepare", "err": err.Error()})
+			return Fail
+		}
+	} else if err := githubDependencies(c.Repo, c.Issue); err != nil {
+		logEvent(map[string]any{"event": "prepare", "err": err.Error()})
+		return Fail
+	}
 	for _, d := range dependencies(c.Body) {
-		if st, _ := sh(c.Repo, "gh", "issue", "view", strconv.Itoa(d), "--json", "state", "--jq", ".state"); strings.TrimSpace(st) == "OPEN" {
+		if st, err := sh(c.Repo, "gh", "issue", "view", strconv.Itoa(d), "--json", "state", "--jq", ".state"); err != nil || strings.TrimSpace(st) != "CLOSED" {
 			logEvent(map[string]any{"event": "prepare", "err": "dependency still open", "issue": d})
 			return Fail
 		}
 	}
-	branch := "sm/issue-" + strconv.Itoa(c.Issue)
-	if n, _ := sh(c.Repo, "gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number", "--jq", "length"); strings.TrimSpace(n) != "0" && strings.TrimSpace(n) != "" {
-		logEvent(map[string]any{"event": "prepare", "err": "a PR from " + branch + " already exists; this is abort and restart, resolve it first"})
-		return Fail
+	if c.Branch == "" {
+		branch, _, err := nextIssueBranch(c.Repo, c.Issue, "")
+		if err != nil {
+			logEvent(map[string]any{"event": "prepare", "err": err.Error()})
+			return Fail
+		}
+		if strings.HasPrefix(c.Base, "origin/") {
+			if out, err := sh(c.Repo, "git", "fetch", "--", "origin", strings.TrimPrefix(c.Base, "origin/")); err != nil {
+				logEvent(map[string]any{"event": "prepare", "err": "fetch base failed", "out": tail(out, 500)})
+				return Fail
+			}
+		}
+		if out, err := sh(c.Repo, "git", "checkout", "-b", branch, c.Base); err != nil {
+			logEvent(map[string]any{"event": "prepare", "err": "branch", "out": tail(out, 500)})
+			return Fail
+		}
+		c.Branch = branch
 	}
-	_, localErr := sh(c.Repo, "git", "rev-parse", "--verify", "-q", "refs/heads/"+branch)
-	_, remoteErr := sh(c.Repo, "git", "ls-remote", "--exit-code", "--heads", "origin", branch)
-	if localErr == nil || remoteErr == nil {
-		logEvent(map[string]any{"event": "prepare", "err": "branch " + branch + " already exists (local or origin); delete it if it holds nothing you want"})
-		return Fail
+	logEvent(map[string]any{"event": "branch", "branch": c.Branch, "base": c.Base})
+	if settings.Legacy {
+		c.Export = exportState()
 	}
-	if out, err := sh(c.Repo, "git", "checkout", "-b", branch); err != nil {
-		logEvent(map[string]any{"event": "prepare", "err": "branch", "out": tail(out, 500)})
-		return Fail
-	}
-	c.Export = exportState()
 	return Ok
 }
 
@@ -620,15 +713,19 @@ func exportState() string {
 // dispatch text (prompts/original/orchestrator.md) so the role prompts read it as before.
 func dispatch(c *Ctx, role, extra string) string {
 	notes := ""
-	if d := os.Getenv("SM_NOTES_DIR"); d != "" { // operator notes: all.md for every step, <role>.md for one
+	if d := settings.NotesDir; d != "" {
 		for _, f := range []string{"all.md", role + ".md"} {
 			if b, err := os.ReadFile(filepath.Join(d, f)); err == nil {
 				notes += "\n\nOperator notes:\n" + string(b)
 			}
 		}
 	}
-	return fmt.Sprintf("Dispatch: you are the %s. Ghidra copy: %s. Export: %s. Sub-issue #%d. Scratch directory: %s.%s%s\n\n%s\n\nStart now.",
-		role, c.Ghidra, c.Export, c.Issue, c.Scratch, extra, notes, issueText(c))
+	project := ""
+	if settings.Legacy {
+		project = fmt.Sprintf(" Ghidra copy: %s. Export: %s.", c.Ghidra, c.Export)
+	}
+	return fmt.Sprintf("Dispatch: you are the %s.%s Issue #%d. Scratch directory: %s.%s%s\n\n%s\n\nStart now.",
+		role, project, c.Issue, c.Scratch, extra, notes, issueText(c)+c.Comments)
 }
 
 func plan(c *Ctx) Out {
@@ -642,11 +739,19 @@ func plan(c *Ctx) Out {
 		NeedsInvestigation bool `json:"needs_investigation"`
 		FitsOnePR          bool `json:"fits_one_pr"`
 		Units              []Unit
+		IssuePlan          *WorkPlan `json:"issue_plan"`
 	}
 	if o := agent(c, Plan, dispatch(c, steps[Plan].Role, ""), &r); o != Ok {
 		return o
 	}
 	c.Objective, c.Points, c.PointsDerived, c.Files, c.Verification, c.Units = r.Objective, r.Points, r.PointsDerived, r.Files, r.Verification, r.Units
+	if r.IssuePlan != nil {
+		if err := r.IssuePlan.validate(); err != nil {
+			logEvent(map[string]any{"event": "invalid-issue-plan", "err": err.Error()})
+			return Invalid
+		}
+		c.Proposal = r.IssuePlan
+	}
 	switch {
 	case r.Status == "blocked":
 		return Blocked
@@ -710,6 +815,9 @@ func taskText(c *Ctx) string {
 }
 
 func execute(c *Ctx) Out {
+	if err := manageRun(c, true, 0, "Implementation started.", true); err != nil {
+		return Blocked
+	}
 	var r struct {
 		Status      string
 		Summary     string
@@ -733,16 +841,24 @@ func execute(c *Ctx) Out {
 }
 
 func runChecks(c *Ctx) bool {
-	// shortcut: fixed cargo commands, override with SM_CHECKS (newline separated) for other repos.
-	cmds := []string{"cargo fmt --all -- --check", "cargo clippy --workspace --all-targets -- -D warnings", "cargo test --workspace"}
-	if v := os.Getenv("SM_CHECKS"); v != "" {
-		cmds = strings.Split(v, "\n")
+	if len(settings.Checks) == 0 {
+		c.Feedback = "no checks configured"
+		return false
 	}
-	for _, cmd := range cmds {
-		if out, err := sh(c.Repo, "sh", "-c", cmd); err != nil {
+	resultDir, err := os.MkdirTemp(c.Scratch, "checks-")
+	if err != nil {
+		c.Feedback = "cannot create check output directory: " + err.Error()
+		return false
+	}
+	for _, cmd := range settings.Checks {
+		if out, err := checkCommand(c.Repo, cmd, "SM_CHECK_RESULTS="+resultDir, "SM_SCRATCH="+c.Scratch); err != nil {
 			c.Feedback = "check failed: " + cmd + "\n" + tail(out, 4000)
 			return false
 		}
+	}
+	if err := verifyTestReports(resultDir, settings.TestReports); err != nil {
+		c.Feedback = err.Error()
+		return false
 	}
 	return true
 }
@@ -773,24 +889,28 @@ func reviewDiff(diff, stat string) string {
 func check(c *Ctx) Out {
 	// Formatting needs no judgment: fix it here instead of failing the format check and
 	// spending an execute round. SM_FMT overrides; with SM_CHECKS set and no SM_FMT, nothing runs.
-	fmtCmd := "cargo fmt --all"
-	if os.Getenv("SM_CHECKS") != "" {
-		fmtCmd = ""
-	}
-	if v, ok := os.LookupEnv("SM_FMT"); ok {
-		fmtCmd = v
-	}
+	fmtCmd := settings.Format
 	if fmtCmd != "" {
-		sh(c.Repo, "sh", "-c", fmtCmd) // a failure here shows up in the checks below
+		if out, err := checkCommand(c.Repo, fmtCmd, "SM_SCRATCH="+c.Scratch); err != nil {
+			c.Feedback = "formatter failed: " + fmtCmd + "\n" + tail(out, 4000)
+			return Fail
+		}
 	}
 	if out, err := sh(c.Repo, "git", "add", "-A"); err != nil {
 		c.Feedback = "git add failed: " + out
 		return Fail
 	}
 	if len(c.Files) > 0 { // the scope gate: a diff outside the planned files never reaches review
-		names, _ := sh(c.Repo, "git", "diff", "--cached", "--name-only")
+		names, err := sh(c.Repo, "git", "diff", "--cached", "--name-only", "-z")
+		if err != nil {
+			c.Feedback = "cannot read staged paths: " + tail(names, 500)
+			return Fail
+		}
 		var bad []string
-		for _, n := range strings.Fields(names) {
+		for _, n := range strings.Split(strings.TrimSuffix(names, "\x00"), "\x00") {
+			if n == "" {
+				continue
+			}
 			if !inScope(n, c.Files) {
 				bad = append(bad, n)
 			}
@@ -800,7 +920,25 @@ func check(c *Ctx) Out {
 			return Fail
 		}
 	}
+	candidate, err := sh(c.Repo, "git", "write-tree")
+	if err != nil {
+		c.Feedback = "cannot record staged candidate: " + tail(candidate, 500)
+		return Fail
+	}
 	if !runChecks(c) {
+		return Fail
+	}
+	after, err := sh(c.Repo, "git", "write-tree")
+	if err != nil || after != candidate {
+		c.Feedback = "checks changed the staged candidate; review the changes before retrying"
+		return Fail
+	}
+	if _, err := sh(c.Repo, "git", "diff", "--quiet"); err != nil {
+		c.Feedback = "checks changed the worktree; review and stage the intended changes before retrying"
+		return Fail
+	}
+	if out, err := sh(c.Repo, "git", "ls-files", "--others", "--exclude-standard", "-z"); err != nil || out != "" {
+		c.Feedback = "checks left untracked files; review them or put check outputs outside the worktree"
 		return Fail
 	}
 	diff, _ := sh(c.Repo, "git", "diff", "--cached")
@@ -851,8 +989,9 @@ func run(c *Ctx) Exit {
 		if runCtx.Err() != nil {
 			return Stopped
 		}
-		if c.RunBudget > 0 && c.Cost >= c.RunBudget {
-			logEvent(map[string]any{"event": "run-budget-reached", "before": s.String(), "cost_usd": c.Cost, "limit_usd": c.RunBudget})
+		if c.RunBudget > 0 && (c.Cost >= c.RunBudget || c.CostUnknown > 0) {
+			logEvent(map[string]any{"event": "run-budget-reached", "before": s.String(),
+				"usage": c.Cost, "limit": c.RunBudget, "usage_unit": settings.unit(), "usage_unknown": c.CostUnknown > 0})
 			return GaveUp
 		}
 		visits[s]++
@@ -864,7 +1003,8 @@ func run(c *Ctx) Exit {
 		if !contains(steps[s].Outs, o) {
 			panic(fmt.Sprintf("step %v returned undeclared out %v", s, o))
 		}
-		logEvent(map[string]any{"state": s.String(), "out": o.String(), "visit": visits[s], "cost_usd": c.Cost})
+		logEvent(map[string]any{"state": s.String(), "out": o.String(), "visit": visits[s],
+			"usage": c.Cost, "usage_unit": settings.unit(), "provider": settings.Provider, "usage_unknown": c.CostUnknown > 0})
 		n := next(s, o, visits)
 		if o == More {
 			visits[s] = 0 // invalid-output retries count per unit
@@ -877,6 +1017,24 @@ func run(c *Ctx) Exit {
 }
 
 func main() {
+	args := os.Args[1:]
+	configPath := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--config" {
+			if i+1 == len(args) {
+				fmt.Fprintln(os.Stderr, "--config requires a path")
+				os.Exit(2)
+			}
+			configPath = args[i+1]
+			args = append(args[:i], args[i+2:]...)
+			i--
+		}
+	}
+	if len(args) == 0 {
+		args = []string{"serve"}
+	}
+	os.Args = append(os.Args[:1], args...)
+	managementCommand = len(args) > 0 && (args[0] == "issues" || args[0] == "reconcile")
 	if len(os.Args) >= 2 && os.Args[1] == "stats" {
 		path := "agent-sm-stats.jsonl"
 		if len(os.Args) > 2 {
@@ -890,6 +1048,87 @@ func main() {
 		fmt.Print(report(b))
 		return
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "allow" {
+		if os.Getenv("SM_PROVIDER") == "copilot" {
+			fmt.Fprintln(os.Stderr, "allow suggestions use Claude syntax; use profile commands for Copilot")
+			os.Exit(2)
+		}
+	} else if configPath == "" && len(args) > 0 && args[0] == "serve" {
+		p, err := autoProfile(".")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		settings = p
+	} else {
+		p, err := loadProfile(configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		settings = p
+	}
+	var stop context.CancelFunc
+	runCtx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if len(args) > 0 && args[0] == "issues" {
+		if err := issuesCLI(runCtx, args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if (len(os.Args) == 4 || (len(os.Args) == 5 && os.Args[4] == "--apply")) && os.Args[1] == "reconcile" {
+		n, err := strconv.Atoi(os.Args[3])
+		if err != nil || n <= 0 {
+			fmt.Fprintln(os.Stderr, "issue number must be positive")
+			os.Exit(2)
+		}
+		if settings.Management.Mode == "service" {
+			m, err := newManager(runCtx, os.Args[2], settings)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			if len(os.Args) == 4 {
+				result := reconcileJira(&Ctx{Repo: os.Args[2], Issue: n})
+				b, _ := json.Marshal(result)
+				fmt.Println(string(b))
+				if result.Status != "already aligned" {
+					os.Exit(1)
+				}
+				return
+			}
+			if err == nil && len(os.Args) == 5 {
+				err = m.register(runCtx, n, false, 0, "")
+				if err == nil {
+					err = m.reconcile(runCtx, n, true)
+				}
+			}
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			b, err := m.snapshot(runCtx)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			fmt.Println(string(b))
+			return
+		}
+		if len(os.Args) == 5 {
+			fmt.Fprintln(os.Stderr, "--apply requires exclusive service-management mode")
+			os.Exit(1)
+		}
+		result := reconcileJira(&Ctx{Repo: os.Args[2], Issue: n})
+		b, _ := json.Marshal(result)
+		fmt.Println(string(b))
+		if result.Status != "already aligned" {
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "serve" { // agent-sm serve [--repo DIR] [issue] [addr]
 		issue, addr, repo := "", "127.0.0.1:8787", ""
 		args := os.Args[2:]
@@ -901,6 +1140,13 @@ func main() {
 				issue = args[i]
 			} else {
 				addr = args[i]
+			}
+		}
+		if repo == "" && configPath == "" {
+			var err error
+			repo, err = canonicalRepo(".")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "agent-sm: could not auto-select the current repository: %v\n", err)
 			}
 		}
 		fmt.Fprintln(os.Stderr, serve(issue, addr, repo))
@@ -920,12 +1166,12 @@ func main() {
 		return
 	}
 	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: agent-sm <repo-dir> <issue-number> | agent-sm stats|allow [file] | agent-sm serve [--repo DIR] [issue] [addr]  (SM_PUBLISH=pr|merge to push, open PRs, merge; see README.md)")
+		fmt.Fprintln(os.Stderr, "usage: agent-sm [--config FILE] <repo-dir> <issue-number> | agent-sm stats|allow [file] | agent-sm [--config FILE] serve [--repo DIR] [issue] [addr] | agent-sm --config FILE reconcile <repo-dir> <issue-number> (see README.md)")
 		os.Exit(2)
 	}
 	n, err := strconv.Atoi(os.Args[2])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "issue number must be an integer")
+	if err != nil || n <= 0 {
+		fmt.Fprintln(os.Stderr, "issue number must be a positive integer")
 		os.Exit(2)
 	}
 	// A panic means a hole in our table: log it, leave the branch as it is, exit non-zero.
@@ -940,11 +1186,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "SM_PUBLISH must be empty, pr or merge")
 		os.Exit(2)
 	}
-	c := &Ctx{Repo: os.Args[1], Issue: n, Level: level, Ghidra: "none", Scratch: filepath.Join(scratchRoot(), strconv.Itoa(n)), RunBudget: 20}
-	if v, err := strconv.ParseFloat(os.Getenv("SM_RUN_BUDGET"), 64); err == nil && v >= 0 {
-		c.RunBudget = v // 0 turns the limit off
-	}
-	if v := os.Getenv("SM_GHIDRA_COPY"); v != "" {
+	c := &Ctx{Repo: os.Args[1], Issue: n, Level: level, Ghidra: "none", Scratch: filepath.Join(scratchRoot(), strconv.Itoa(n)), RunBudget: settings.RunLimit, Base: os.Getenv("SM_WORKTREE_BASE"), Branch: os.Getenv("SM_WORKTREE_BRANCH")}
+	if v := os.Getenv("SM_GHIDRA_COPY"); settings.Legacy && v != "" {
 		c.Ghidra = v
 	}
 	if v := os.Getenv("SM_SCRATCH"); v != "" {
@@ -958,16 +1201,38 @@ func main() {
 		os.Rename(eventsPath, strings.TrimSuffix(eventsPath, ".jsonl")+"-"+time.Now().Format("20060102-150405")+".jsonl")
 	}
 	// SIGINT or SIGTERM (the page's Stop) ends the current step; the cleanup and exit event below still run.
-	var stop context.CancelFunc
-	runCtx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	exit := run(c)
 	followUp(c, exit)
+	if settings.Management.Mode == "service" && exit != Ready {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		m, err := newManager(ctx, c.Repo, settings)
+		if err == nil {
+			err = m.deactivate(ctx, c.Issue, string(exit))
+		}
+		if err != nil {
+			c.ManagementError = err.Error()
+			logEvent(map[string]any{"event": "management-deactivation-failed", "err": err.Error()})
+		}
+		cancel()
+	}
+	if settings.Management.Mode == "service" && exit != Stopped {
+		manageRun(c, false, 0, fmt.Sprintf("Coding outcome: %s\n%s\n%s\n\nPoints:\n%s\n\nEvidence:\n%s", exit, c.Summary, c.Verdict, strings.Join(c.Points, "\n"), c.Evidence), true)
+	}
 	stopGhidra(c)
 	cleanupWorktree(c)
-	logEvent(map[string]any{"exit": string(exit), "cost_usd": c.Cost, "sessions_with_unknown_cost": c.CostUnknown})
+	management := ""
+	if settings.Management.Mode == "service" {
+		management = "aligned"
+		if c.ManagementError != "" {
+			management = "pending"
+		}
+	}
+	logEvent(map[string]any{"exit": string(exit), "management": management, "management_error": c.ManagementError, "provider": settings.Provider, "usage": c.Cost, "usage_unit": settings.unit(), "sessions_with_unknown_cost": c.CostUnknown})
 	fmt.Println(exit)
-	if exit != Ready {
+	if c.ManagementError != "" {
+		fmt.Fprintln(os.Stderr, "Synchronization incomplete: "+c.ManagementError)
+	}
+	if exit != Ready || c.ManagementError != "" {
 		os.Exit(1)
 	}
 }

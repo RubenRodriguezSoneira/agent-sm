@@ -23,7 +23,7 @@
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
-  button, input, select { font: inherit; color: inherit; }
+  button, input, select, textarea { font: inherit; color: inherit; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .mute { color: var(--mute); }
@@ -61,6 +61,13 @@
   .btn.primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.08); }
   .btn.danger { color: var(--bad); }
   .btn:disabled { opacity: .45; cursor: default; }
+  .folder-picker { width: min(680px, calc(100% - 32px)); max-height: 85vh; padding: 20px; color: var(--ink); }
+  .folder-picker::backdrop { background: rgba(0, 0, 0, .4); }
+  .folder-picker label { display: flex; flex-direction: column; gap: 4px; }
+  .folder-picker ul { list-style: none; padding: 0; max-height: 40vh; overflow: auto; }
+  .folder-picker li + li { margin-top: 6px; }
+  .folder-picker li button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+  #folderStatus { overflow-wrap: anywhere; }
 
   /* issues */
   .issues { display: none; } .issues.on { display: block; }
@@ -87,6 +94,14 @@
   .runbar input[type=number] { width: 74px; }
   .queue { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; font-size: 12px; align-items: center; }
   #msg { color: var(--bad); font-size: 13px; margin-top: 8px; }
+
+  /* tracker management */
+  .management { padding: 14px 16px; }
+  .management textarea { display: block; width: 100%; margin-top: 6px; font-family: var(--mono); resize: vertical; }
+  .management p { margin: 0 0 10px; }
+  .management .runbar { padding: 0; margin-bottom: 10px; }
+  .management pre { margin: 6px 0 12px; }
+  #managementDigest { overflow-wrap: anywhere; }
 
   /* run summary */
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
@@ -161,6 +176,27 @@
 </div></header>
 
 <main>
+  <section class="panel runbar" aria-label="Run setup">
+    <label>Repository path <input class="field" id="repoPath" type="text" size="36" placeholder="/path/to/git/repository"></label>
+    <button class="btn" id="browseRepo" type="button">Browse folders</button>
+    <label>Language profile <select class="field" id="language"><option value="auto">Auto detect</option><option value="server">Server profile</option><option value="go">Go</option><option value="dotnet">.NET example (Inventory)</option></select></label>
+    <label>Agent <select class="field" id="agent"><option value="copilot">Copilot</option><option value="claude">Claude</option></select></label>
+    <button class="btn primary" id="selectRepo">Use setup</button>
+  </section>
+  <div id="msg" role="alert"></div>
+  <dialog class="panel folder-picker" id="folderPicker" aria-labelledby="folderTitle">
+    <div class="head"><h2 id="folderTitle">Choose a repository folder</h2><button class="btn" id="folderCancel" type="button">Cancel</button></div>
+    <p class="mute">Folders on the computer running agent-sm. Select a Git working tree; nothing is uploaded.</p>
+    <form class="head" id="folderForm">
+      <label class="grow">Folder path <input class="field" id="folderPath" type="text" autocomplete="off"></label>
+      <button class="btn" type="submit">Go</button>
+      <button class="btn" id="folderHome" type="button">Home</button>
+      <button class="btn" id="folderUp" type="button" disabled>Up</button>
+    </form>
+    <p id="folderStatus" role="status"></p>
+    <ul id="folderList" aria-label="Subfolders"></ul>
+    <button class="btn primary" id="folderUse" type="button" disabled>Use this repository</button>
+  </dialog>
   <section class="issues" id="issuesPanel">
     <div class="head">
       <h2>Open issues</h2><span class="count" id="issueCount"></span>
@@ -172,14 +208,45 @@
       <b id="selCount">Nothing selected</b>
       <span class="grow"></span>
       <label>Publish <select class="field" id="publish"><option value="">local branch only</option><option value="pr">open a draft PR</option></select></label>
-      <label>Budget per step $ <input class="field" type="number" id="budget" value="2" min="0.5" step="0.5"></label>
-      <label><input type="checkbox" id="audit"> audit mode</label>
+      <span id="provider"></span>
+      <label>Limit per step <span id="budgetUnit"></span> <input class="field" type="number" id="budget" value="2" min="0.01" step="0.01" required></label>
+      <span class="mute" id="runBudget"></span>
+      <label title="Save prompts, responses and available tool messages locally. May contain sensitive code or output."><input type="checkbox" id="transcripts"> Save transcripts</label>
+      <label title="Claude only: bypass permission approvals to measure tool use. Not transcript logging."><input type="checkbox" id="audit"> permission audit</label>
       <button class="btn danger" id="stopBtn" disabled>Stop</button>
       <button class="btn primary" id="runBtn" disabled>Run</button>
     </div>
     <div class="panel runbar" id="modelBar"><b>Models</b><span class="mute" style="font-size:12px">per step, for the runs you start next</span><span class="grow"></span><span id="models" style="display:contents"></span></div>
     <div class="queue" id="qstate"></div>
-    <div id="msg" role="alert"></div>
+  </section>
+
+  <section aria-labelledby="managementHeading">
+    <div class="head"><h2 id="managementHeading">Tracker management</h2><span class="count" id="managementMode" role="status">Checking service mode…</span></div>
+    <div class="panel management" id="managementPanel" aria-busy="false">
+      <p class="mute" id="managementHelp">Preview is read-only. Apply writes the approved structure to trackers; Reconcile retries managed operations and configured lifecycle updates. Service management is separate from Publish and can update issues even for local-only runs.</p>
+      <label for="managementPlan">Issue plan JSON</label>
+      <textarea class="field" id="managementPlan" rows="6" spellcheck="false" aria-describedby="managementHelp" placeholder='{"id":"example","items":[{"id":"story","title":"Example story","body":"Describe the work","kind":"story"}]}' disabled></textarea>
+      <div class="runbar">
+        <button class="btn" id="managementPreview" disabled>Preview (read-only)</button>
+        <button class="btn" id="managementRefresh">Refresh status</button>
+        <button class="btn" id="managementReconcile" disabled>Reconcile / retry</button>
+      </div>
+      <div id="managementProposal" hidden>
+        <h3>Read-only preview</h3>
+        <pre id="managementPreviewData" tabindex="0" aria-label="Proposed tracker operations"></pre>
+        <p>Digest: <strong class="num" id="managementDigest"></strong></p>
+        <div class="runbar">
+          <label><input type="checkbox" id="managementApprove" aria-describedby="managementDigest" disabled> I approve exactly this displayed digest</label>
+          <button class="btn danger" id="managementApply" disabled>Apply approved digest</button>
+        </div>
+      </div>
+      <p id="managementNotice" role="status"></p>
+      <p id="managementError" class="no" role="alert"></p>
+      <details open>
+        <summary>Managed operations, items and sync errors</summary>
+        <pre id="managementState" tabindex="0" aria-label="Managed operation status">No status loaded.</pre>
+      </details>
+    </div>
   </section>
 
   <section>
@@ -199,7 +266,7 @@
 
   <section>
     <div class="head"><h2>Steps</h2><span class="count" id="stepCount"></span></div>
-    <div class="panel tablewrap"><table><thead><tr><th>#</th><th>state</th><th>unit</th><th>result</th><th>model</th><th class="r">turns</th><th class="r">min</th><th class="r">tools</th><th class="r">denied</th><th class="r">step $</th><th class="r">run $</th></tr></thead><tbody id="steps"></tbody></table></div>
+    <div class="panel tablewrap"><table><thead><tr><th>#</th><th>state</th><th>unit</th><th>result</th><th>model</th><th class="r">turns</th><th class="r">min</th><th class="r">tools</th><th class="r">denied</th><th class="r">step usage</th><th class="r">run usage</th></tr></thead><tbody id="steps"></tbody></table></div>
   </section>
 
   <section id="deniedBox" hidden>
@@ -209,7 +276,10 @@
 </main>
 <script>
 const TOKEN = "__TOKEN__";
+const DEFAULT_REPO = __REPO__;
+const DEFAULT_AGENT = __AGENT__;
 let OLD = [], QERR = "", EDGES = [], ISSUES = [], QUEUE = {}, SEL = new Set(), CAN_RUN = false, BUSY = false, RUNNING = false, PICKED = null, TIMER;
+let SELECTED_REPO = "", SELECTED_LANGUAGE = "auto", SELECTED_AGENT = DEFAULT_AGENT;
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // put sets an element's HTML only when it changed, so scroll positions and focus survive a poll.
@@ -230,6 +300,9 @@ function render(data) {
   $("issue").textContent = data.issue ? "#" + data.issue : "no run";
   const events = data.events || [], st = data.status;
   const exitEv = events.filter(e => e.exit).pop();
+  const provider = (exitEv || {}).provider || (events.find(e => e.provider) || {}).provider || (st || {}).provider || "claude";
+  const usage = n => provider === "copilot" ? fmt(n) + " credits" : "$" + fmt(n);
+  const stepUsage = s => s.provider === "copilot" ? s.credits : s.cost_usd;
   // Each agent session logs its stats just before its step's result: join them.
   const steps = [];
   let pending = null, lastT = 0;
@@ -243,7 +316,10 @@ function render(data) {
   steps.forEach((e, i) => {
     const p = per[e.state] = per[e.state] || { visits: 0, cost: 0 };
     p.visits++; p.last = e;
-    if (e.s) { p.cost += e.s.cost_usd || 0; total += e.s.cost_usd || 0; p.model = e.s.model || p.model; }
+    if (e.s) {
+      p.cost += stepUsage(e.s) || 0; total += stepUsage(e.s) || 0; p.model = e.s.model || "unknown";
+      p.unknown = p.unknown || e.s.usage_unknown || e.s.killed || (e.s.provider === "copilot" && e.s.credits == null);
+    }
     const nxt = steps[i + 1] ? steps[i + 1].state : (exitEv ? exitEv.exit : null);
     if (nxt) { const k = e.state + "|" + e.out + "|" + nxt; taken[k] = (taken[k] || 0) + 1; }
   });
@@ -262,9 +338,10 @@ function render(data) {
   const pill = $("pill");
   pill.className = "pill " + (exitEv ? exitCls(exitEv.exit) : stale ? "warn" : live ? "run" : "");
   pill.textContent = exitEv ? exitEv.exit : stale ? "no update for " + idleMin + " min" : live ? live : "idle";
-  const cost = exitEv ? exitEv.cost_usd : (lastStep ? lastStep.cost_usd : 0);
-  const unknown = exitEv && exitEv.sessions_with_unknown_cost;
-  $("cost").textContent = data.issue ? "$" + fmt(cost) + (unknown ? " + ?" : "") : "";
+  const usageEvent = exitEv || lastStep || {};
+  const cost = usageEvent.usage ?? usageEvent.cost_usd ?? 0;
+  const unknown = usageEvent.sessions_with_unknown_cost || usageEvent.usage_unknown;
+  $("cost").textContent = data.issue ? usage(cost) + (unknown ? " + unknown" : "") : "";
   document.title = (data.issue ? "#" + data.issue + " " : "") + (exitEv ? exitEv.exit : (live || "idle")) + " - agent-sm";
 
   const feed = (st && st.feed) || [];
@@ -276,9 +353,9 @@ function render(data) {
 
   const cards = [["State", exitEv ? "ended: " + exitEv.exit : (live || "idle"), exitEv ? (exitEv.exit === "ready" ? "ok" : "no") : ""]];
   if (session && st.units > 0) cards.push(["Unit", st.unit_index + " / " + st.units + " " + esc(st.unit || ""), ""]);
-  if (session && !stale) { cards.push(["This step", sec(st.elapsed_s), ""]); cards.push(["Tool calls", st.tool_calls, ""]); }
+  if (session && !stale) { cards.push(["This step", sec(st.elapsed_s), ""]); cards.push(["Tool calls", st.tool_telemetry_available === false ? "unknown" : st.tool_calls, ""]); }
   cards.push(["Steps run", steps.length, ""]);
-  cards.push(["Run cost", "$" + fmt(cost) + (unknown ? " + ?" : ""), ""]);
+  cards.push(["Run usage", usage(cost) + (unknown ? " + unknown" : ""), ""]);
   put("cards", cards.map(c => `<div class="panel stat"><span>${c[0]}</span><b class="${c[2]}">${c[1]}</b></div>`).join(""));
 
   const names = [...new Set(EDGES.map(e => e.from))];
@@ -291,7 +368,7 @@ function render(data) {
       <span class="n-top"><span class="dot"></span>${live === name ? "running" : (p.visits ? "ran " + p.visits + "x" : "not run")}</span>
       <b>${name}</b>
       <span class="res ${p.last ? outCls(p.last.out) : ""}">${p.last ? p.last.out : ""}</span>
-      <span class="cost">${p.cost ? "$" + fmt(p.cost) + " · " + share + "%" : ""}</span>
+      <span class="cost">${p.cost ? usage(p.cost) + " · " + share + "%" : ""}${p.unknown ? " + unknown" : ""}</span>
       <span class="bar"><i style="width:${share}%"></i></span>
     </button>`;
   }).join(""));
@@ -303,17 +380,18 @@ function render(data) {
   }).join("");
   const res = p.last && p.last.s && p.last.s.result;
   put("detail", sel ? `<h3>${sel}</h3>
-    <div class="mute">${p.model ? "agent step on " + esc(p.model) : (p.visits ? "program step, no agent" : "has not run in this run")}${p.visits ? " · ran " + p.visits + "x" : ""}${p.cost ? " · $" + fmt(p.cost) : ""}</div>
+    <div class="mute">${p.model ? "agent step on " + esc(p.model) : (p.visits ? "program step, no agent" : "has not run in this run")}${p.visits ? " · ran " + p.visits + "x" : ""}${p.cost ? " · " + usage(p.cost) : ""}${p.unknown ? " + unknown" : ""}</div>
     <div class="sub">Where each result leads</div><div class="outs">${chips}</div>
     ${res ? `<div class="sub">Last result</div><pre>${esc(pretty(res))}</pre>` : ""}` : '<div class="empty">No run yet.</div>');
 
   $("stepCount").textContent = steps.length ? steps.length + " so far" : "";
   put("steps", steps.map((e, i) => {
     const s = e.s || {}, a = !!e.s;
-    const calls = Object.values(s.tool_calls || {}).reduce((x, y) => x + y, 0);
-    const den = s.permission_denials || 0;
-    const w = a && total ? Math.round(100 * (s.cost_usd || 0) / total) : 0;
-    return `<tr><td class="mute">${i + 1}</td><td><b>${e.state}</b></td><td>${esc(s.unit || "")}</td><td><span class="chip ${outCls(e.out) === "ok" ? "good" : outCls(e.out) === "no" ? "bad" : "warn"}">${e.out}${s.killed ? " (killed)" : ""}</span></td><td class="mute">${esc(s.model || "")}</td><td class="r">${a ? s.turns : ""}</td><td class="r">${a ? fmt((s.duration_ms || 0) / 60000, 1) : ""}</td><td class="r">${a ? calls : ""}</td><td class="r ${den ? "no" : ""}">${a ? den : ""}</td><td class="r costcell">${a ? (s.killed ? "?" : "$" + fmt(s.cost_usd)) : ""}<i style="--w:${w}%"></i></td><td class="r">$${fmt(e.cost_usd)}</td></tr>`;
+    const telemetry = s.provider !== "copilot";
+    const calls = telemetry ? Object.values(s.tool_calls || {}).reduce((x, y) => x + y, 0) : "unknown";
+    const den = telemetry ? (s.permission_denials || 0) : "unknown";
+    const w = a && total ? Math.round(100 * (stepUsage(s) || 0) / total) : 0;
+    return `<tr><td class="mute">${i + 1}</td><td><b>${e.state}</b></td><td>${esc(s.unit || "")}</td><td><span class="chip ${outCls(e.out) === "ok" ? "good" : outCls(e.out) === "no" ? "bad" : "warn"}">${e.out}${s.killed ? " (killed)" : ""}</span></td><td class="mute">${esc(s.model || "")}</td><td class="r">${a ? (telemetry ? s.turns : "unknown") : ""}</td><td class="r">${a ? fmt((s.duration_ms || 0) / 60000, 1) : ""}</td><td class="r">${a ? calls : ""}</td><td class="r">${a ? den : ""}</td><td class="r costcell">${a ? (s.killed || s.usage_unknown ? "unknown" : usage(stepUsage(s))) : ""}<i style="--w:${w}%"></i></td><td class="r">${usage(e.usage ?? e.cost_usd)}${e.usage_unknown ? " + unknown" : ""}</td></tr>`;
   }).join("") || `<tr><td colspan="11" class="empty">No steps yet.${CAN_RUN ? " Select issues above and press Run." : " Start a run with: agent-sm &lt;repo-dir&gt; &lt;issue-number&gt;"}</td></tr>`);
 
   const denied = steps.filter(e => e.s && (e.s.denied_sample || []).length);
@@ -337,7 +415,7 @@ function renderIssues() {
     const s = state[i.number], busy = s && (s[0] === "running" || s[0] === "queued");
     return `<label class="icard${busy ? " busy" : ""}">
       <input type="checkbox" data-n="${i.number}" ${SEL.has(i.number) ? "checked" : ""} ${busy ? "disabled" : ""}>
-      <span class="i-top"><span class="i-num">#${i.number}</span><span>${i.updatedAt ? age(i.updatedAt) : ""}</span>${s ? `<span class="chip ${s[1]}">${esc(s[0])}</span>` : ""}${left.has(i.number) && !busy ? `<span class="chip warn" title="A worktree from an earlier run still holds its staged changes. Running this issue again discards them.">old work</span>` : ""}${i.blocked ? `<span class="chip warn" title="GitHub lists ${i.blocked} open issue(s) as blocking this one">blocked</span>` : ""}<span class="check"></span></span>
+      <span class="i-top"><span class="i-num">#${i.number}</span><span>${i.updatedAt ? age(i.updatedAt) : ""}</span>${s ? `<span class="chip ${s[1]}">${esc(s[0])}</span>` : ""}${left.has(i.number) && !busy ? `<span class="chip warn" title="Earlier work is kept. A new run uses a numbered branch and worktree from the issue's base.">old work kept</span>` : ""}${i.blocked ? `<span class="chip warn" title="GitHub lists ${i.blocked} open issue(s) as blocking this one">blocked</span>` : ""}<span class="check"></span></span>
       <span class="i-title">${esc(i.title)}</span>
       ${i.subs ? `<span class="i-subs" title="Selecting this issue runs its open sub-issues, not the issue itself"><span class="bar"><i style="width:${Math.round(100 * i.subsDone / i.subs)}%"></i></span>${i.subsDone} of ${i.subs} sub-issues done</span>` : ""}
       <span class="i-labels">${i.labels.map(l => `<span class="lbl"${/^[0-9a-f]{6}$/i.test(l.color || "") ? ` style="--c:#${l.color}"` : ""}>${esc(l.name)}</span>`).join("")}</span>
@@ -347,10 +425,12 @@ function renderIssues() {
   $("selCount").textContent = n ? n + (n === 1 ? " issue selected" : " issues selected") : "Nothing selected";
   $("runBtn").disabled = n === 0;
   OLD = [...SEL].filter(x => left.has(x)).sort((a, b) => a - b);
-  $("runBtn").textContent = OLD.length ? "Discard old work and run" : (n > 1 ? "Run " + n + " issues" : "Run");
+  $("runBtn").textContent = OLD.length ? "Run fresh attempt" : (n > 1 ? "Run " + n + " issues" : "Run");
 }
 async function loadIssues(refresh) {
-  const r = await fetch("/api/issues" + (refresh ? "?refresh=1" : ""));
+  const params = new URLSearchParams({ repo: SELECTED_REPO });
+  if (refresh) params.set("refresh", "1");
+  const r = await fetch("/api/issues?" + params);
   if (!r.ok) { $("msg").textContent = "Cannot list issues: " + await r.text(); return; }
   ISSUES = await r.json(); renderIssues();
 }
@@ -359,27 +439,137 @@ async function post(path, body) {
   if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status });
   return r.json();
 }
-// One picker per agent step. The server's default is preselected; a choice is remembered in this browser.
-const MODELS = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"];
-function saved() { try { return JSON.parse(localStorage.getItem("sm-models")) || {}; } catch { return {}; } }
+let MANAGEMENT_ENABLED = false, MANAGEMENT_BUSY = false, MANAGEMENT_PREVIEW = null, MANAGEMENT_INPUT = "";
+function managementControls() {
+  const available = MANAGEMENT_ENABLED && !MANAGEMENT_BUSY;
+  $("managementPanel").setAttribute("aria-busy", String(MANAGEMENT_BUSY));
+  $("managementPlan").disabled = !available;
+  $("managementPreview").disabled = !available || !$("managementPlan").value.trim();
+  $("managementRefresh").disabled = MANAGEMENT_BUSY;
+  $("managementReconcile").disabled = !available;
+  $("managementApprove").disabled = !available || !MANAGEMENT_PREVIEW;
+  $("managementApply").disabled = !available || !MANAGEMENT_PREVIEW || !$("managementApprove").checked || MANAGEMENT_INPUT !== $("managementPlan").value;
+}
+function invalidateManagementPreview() {
+  MANAGEMENT_PREVIEW = null;
+  $("managementApprove").checked = false;
+  managementControls();
+}
+function renderManagementState(state) {
+  $("managementState").textContent = JSON.stringify(state, null, 2);
+}
+async function loadManagement() {
+  if (MANAGEMENT_BUSY) return;
+  MANAGEMENT_BUSY = true; managementControls();
+  try {
+    const r = await fetch("/api/management");
+    if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status });
+    const data = await r.json();
+    MANAGEMENT_ENABLED = data.enabled === true;
+    $("managementMode").textContent = MANAGEMENT_ENABLED ? "Service mode enabled" : "Service mode disabled (read-only status)";
+    renderManagementState(data.state);
+    if (!MANAGEMENT_ENABLED) invalidateManagementPreview();
+  } catch (e) {
+    MANAGEMENT_ENABLED = false;
+    invalidateManagementPreview();
+    $("managementMode").textContent = "Management unavailable";
+    $("managementError").textContent = "Cannot load management status: " + e.message;
+  } finally { MANAGEMENT_BUSY = false; managementControls(); }
+}
+$("managementPlan").addEventListener("input", () => {
+  invalidateManagementPreview();
+  $("managementProposal").hidden = true;
+  $("managementNotice").textContent = "Plan changed. Preview again before applying.";
+});
+$("managementApprove").addEventListener("change", managementControls);
+$("managementRefresh").addEventListener("click", () => {
+  $("managementError").textContent = "";
+  return loadManagement();
+});
+$("managementPreview").addEventListener("click", async () => {
+  if (!MANAGEMENT_ENABLED || MANAGEMENT_BUSY) return;
+  invalidateManagementPreview();
+  $("managementProposal").hidden = true;
+  $("managementError").textContent = "";
+  $("managementNotice").textContent = "";
+  MANAGEMENT_BUSY = true; managementControls();
+  try {
+    const input = $("managementPlan").value;
+    const plan = JSON.parse(input);
+    if (!plan || typeof plan !== "object" || Array.isArray(plan) || typeof plan.id !== "string" || !plan.id.trim() || !Array.isArray(plan.items)) throw new Error("Expected a WorkPlan object with id and items");
+    const preview = await post("/api/management/preview", plan);
+    if (!preview || typeof preview.digest !== "string" || !preview.digest.trim()) throw new Error("Server returned no preview digest");
+    MANAGEMENT_PREVIEW = preview;
+    MANAGEMENT_INPUT = input;
+    $("managementPreviewData").textContent = JSON.stringify(preview, null, 2);
+    $("managementDigest").textContent = preview.digest;
+    $("managementProposal").hidden = false;
+    $("managementNotice").textContent = "Preview only; nothing applied. Review scope, expected state and operations, then approve the digest explicitly.";
+  } catch (e) { $("managementError").textContent = "Cannot preview: " + e.message; }
+  finally { MANAGEMENT_BUSY = false; managementControls(); }
+});
+$("managementApply").addEventListener("click", async () => {
+  if ($("managementApply").disabled) return;
+  const digest = MANAGEMENT_PREVIEW.digest;
+  // Consume approval before sending: an uncertain response must never trigger an automatic retry.
+  invalidateManagementPreview();
+  MANAGEMENT_BUSY = true; managementControls();
+  $("managementError").textContent = "";
+  $("managementNotice").textContent = "Applying approved digest…";
+  try {
+    renderManagementState(await post("/api/management/apply", { digest }));
+    $("managementNotice").textContent = "Apply completed. Refresh status to inspect progress; preview again for any further structural changes.";
+  } catch (e) {
+    $("managementNotice").textContent = "Approval cleared. Inspect status before retrying; ambiguous creates require reconciliation, not blind re-apply.";
+    $("managementError").textContent = "Cannot apply: " + e.message;
+  } finally { MANAGEMENT_BUSY = false; managementControls(); }
+});
+$("managementReconcile").addEventListener("click", async () => {
+  if (!MANAGEMENT_ENABLED || MANAGEMENT_BUSY) return;
+  invalidateManagementPreview();
+  MANAGEMENT_BUSY = true; managementControls();
+  $("managementError").textContent = "";
+  $("managementNotice").textContent = "Reconciling managed operations…";
+  try {
+    renderManagementState(await post("/api/management/reconcile", {}));
+    $("managementNotice").textContent = "Reconciliation completed. Inspect managed status and sync errors. Structural changes still need a new preview and approval.";
+  } catch (e) {
+    $("managementNotice").textContent = "Inspect status before retrying reconciliation.";
+    $("managementError").textContent = "Cannot reconcile: " + e.message;
+  } finally { MANAGEMENT_BUSY = false; managementControls(); }
+});
+
+// Model IDs belong to the selected CLI's catalog, not a hardcoded web catalog.
+function saved() { try { return JSON.parse(localStorage.getItem("sm-models-" + QUEUE.provider)) || {}; } catch { return {}; } }
 function renderModels(defaults) {
   if ($("models").children.length || !defaults) return; // built once: rebuilding would reset an open picker
   const mine = saved();
   $("models").innerHTML = Object.keys(defaults).map(state => {
     const cur = mine[state] || defaults[state];
-    const opts = [...new Set([...MODELS, defaults[state], cur])].filter(Boolean);
-    return `<label>${state} <select class="field" data-state="${state}">${opts.map(m => `<option value="${esc(m)}"${m === cur ? " selected" : ""}>${esc(m.replace(/^claude-/, ""))}${m === defaults[state] ? " (default)" : ""}</option>`).join("")}</select></label>`;
+    return `<label>${state} <input class="field" data-state="${state}" value="${esc(cur)}" aria-label="${state} model"></label>`;
   }).join("");
 }
-const chosenModels = () => Object.fromEntries([...document.querySelectorAll("#models select")].map(s => [s.dataset.state, s.value]));
-$("models").addEventListener("change", () => { try { localStorage.setItem("sm-models", JSON.stringify(chosenModels())); } catch {} });
+const chosenModels = () => Object.fromEntries([...document.querySelectorAll("#models input")].map(s => [s.dataset.state, s.value]));
+$("models").addEventListener("change", () => { try { localStorage.setItem("sm-models-" + QUEUE.provider, JSON.stringify(chosenModels())); } catch {} });
 
 function renderQueue(q) {
+  const first = !QUEUE.provider;
+  const providerChanged = QUEUE.provider && QUEUE.provider !== q.provider;
   QUEUE = q; BUSY = !!q.running; renderModels(q.models);
+  $("provider").textContent = q.provider || "";
+  $("budgetUnit").textContent = q.usage_unit || "";
+  $("budget").min = q.min_session_limit;
+  $("budget").step = q.provider === "copilot" ? "any" : "0.01";
+  $("budget").title = q.provider === "copilot" ? "Copilot requires a minimum limit of " + q.min_session_limit + " AI credits per step." : "";
+  $("runBudget").textContent = "Run limit: " + (q.run_limit ? q.run_limit + " " + q.usage_unit : "unlimited");
+  if (first || providerChanged) $("budget").value = q.session_limit;
+  if (first) $("transcripts").checked = !!q.transcripts;
+  $("audit").disabled = q.provider !== "claude";
+  if ($("audit").disabled) $("audit").checked = false;
   const chips = [];
-  if (q.running) chips.push(`<span class="chip run">running #${q.running.issue}</span>`);
+  if (q.running) chips.push(`<span class="chip run" title="${esc(q.running.branch || "")}">running #${q.running.issue}</span>`);
   (q.queued || []).forEach(j => chips.push(`<span class="chip warn">queued #${j.issue}</span>`));
-  (q.history || []).slice(-6).reverse().forEach(j => chips.push(`<span class="chip ${exitCls(j.exit)}" title="${esc(j.err || "")}">#${j.issue} ${esc(j.exit || "failed")}</span>`));
+  (q.history || []).slice(-6).reverse().forEach(j => chips.push(`<span class="chip ${exitCls(j.exit)}" title="${esc([j.branch, j.err].filter(Boolean).join(" · "))}">#${j.issue} ${esc(j.exit || "failed")}</span>`));
   put("qstate", chips.length ? '<span class="mute">Queue</span>' + chips.join("") : "");
   // The last finished job's failure, until the same issue is running again.
   const last = (q.history || []).slice(-1)[0];
@@ -389,10 +579,79 @@ function renderQueue(q) {
   renderIssues();
 }
 async function pollQueue() {
-  const q = await (await fetch("/api/queue")).json();
+  if (!SELECTED_REPO) return;
+  const q = await (await fetch(selectionURL("/api/queue"))).json();
   if (q.can_run && !CAN_RUN) { CAN_RUN = true; $("issuesPanel").classList.add("on"); loadIssues(false); }
   if (q.can_run) renderQueue(q);
 }
+function selectionURL(path) {
+  const params = new URLSearchParams({ repo: SELECTED_REPO, language: SELECTED_LANGUAGE, provider: SELECTED_AGENT });
+  return path + "?" + params;
+}
+let FOLDER_REQUEST = 0, FOLDER_REPO = "";
+async function loadFolder(path) {
+  const request = ++FOLDER_REQUEST;
+  FOLDER_REPO = "";
+  $("folderUse").disabled = true;
+  $("folderUp").disabled = true;
+  $("folderList").replaceChildren();
+  $("folderStatus").textContent = "Loading folders...";
+  try {
+    const data = await post("/api/folders", { path });
+    if (request !== FOLDER_REQUEST || !$("folderPicker").open) return;
+    $("folderPath").value = data.path;
+    $("folderUp").dataset.path = data.parent;
+    $("folderUp").disabled = data.parent === data.path;
+    $("folderList").innerHTML = data.directories.map(d => `<li><button class="btn" type="button" data-path="${esc(d.path)}">${esc(d.name)}</button></li>`).join("");
+    FOLDER_REPO = data.repo;
+    $("folderStatus").textContent = data.repo ? "Git repository: " + data.repo : data.git_error;
+    $("folderUse").disabled = !data.repo;
+  } catch (e) {
+    if (request === FOLDER_REQUEST) $("folderStatus").textContent = "Cannot browse: " + e.message;
+  }
+}
+$("browseRepo").addEventListener("click", () => {
+  $("folderPicker").showModal();
+  $("folderPath").value = $("repoPath").value.trim();
+  loadFolder($("folderPath").value);
+});
+$("folderCancel").addEventListener("click", () => $("folderPicker").close());
+$("folderPicker").addEventListener("close", () => { FOLDER_REQUEST++; FOLDER_REPO = ""; });
+$("folderForm").addEventListener("submit", e => { e.preventDefault(); loadFolder($("folderPath").value); });
+$("folderPath").addEventListener("input", () => {
+  FOLDER_REQUEST++; FOLDER_REPO = ""; $("folderUse").disabled = true;
+  $("folderStatus").textContent = "Press Go to check this folder.";
+});
+$("folderHome").addEventListener("click", () => loadFolder(""));
+$("folderUp").addEventListener("click", () => loadFolder($("folderUp").dataset.path));
+$("folderList").addEventListener("click", e => {
+  const button = e.target.closest("button[data-path]");
+  if (button) loadFolder(button.dataset.path);
+});
+$("folderUse").addEventListener("click", () => {
+  if (!FOLDER_REPO) return;
+  $("repoPath").value = FOLDER_REPO;
+  $("folderPicker").close();
+  $("selectRepo").click();
+});
+$("selectRepo").addEventListener("click", async () => {
+  SELECTED_REPO = $("repoPath").value.trim();
+  SELECTED_LANGUAGE = $("language").value;
+  SELECTED_AGENT = $("agent").value;
+  SEL.clear(); ISSUES = []; CAN_RUN = false;
+  $("issuesPanel").classList.remove("on");
+  $("models").innerHTML = "";
+  $("msg").textContent = "";
+  if (!SELECTED_REPO) { $("msg").textContent = "Enter a local Git repository path."; return; }
+  try {
+    const r = await fetch(selectionURL("/api/queue"));
+    if (!r.ok) throw new Error(await r.text());
+    const q = await r.json();
+    if (!q.can_run) throw new Error(q.error || "Repository is not available.");
+    CAN_RUN = true; $("issuesPanel").classList.add("on");
+    renderQueue(q); await loadIssues(true);
+  } catch (e) { $("msg").textContent = "Cannot use repository: " + e.message; }
+});
 $("filter").addEventListener("input", renderIssues);
 $("refresh").addEventListener("click", () => loadIssues(true));
 $("issueGrid").addEventListener("change", e => {
@@ -404,39 +663,41 @@ $("pipe").addEventListener("click", e => {
   PICKED = b.dataset.s; tick();
 });
 $("runBtn").addEventListener("click", async () => {
+  if (QUEUE.provider === "copilot" && !$("budget").reportValidity()) return;
   const issues = [...SEL].sort((a, b) => a - b);
   const publish = $("publish").value;
   const parents = issues.filter(n => (ISSUES.find(i => i.number === n) || {}).subs);
   if (!confirm("Run " + issues.map(n => "#" + n).join(", ") + (publish ? " and open draft PRs (this pushes branches)" : " locally") + "?"
-    + (OLD.length ? "\n\n" + OLD.map(n => "#" + n).join(", ") + " still has a worktree from an earlier run. It and its branch sm/issue-<n> will be deleted, with any staged changes in it. This cannot be undone." : "")
+    + "\n\nExisting branches and worktrees are kept. Each fresh attempt starts from the issue's base and uses the next available numbered name."
     + (parents.length ? "\n\n" + parents.map(n => "#" + n).join(", ") + " has sub-issues: its open sub-issues run in its place, one after another. Sub-issues that depend on an open issue are skipped." : ""))) return;
   $("msg").textContent = "";
   try {
     SEL.clear(); PICKED = null;
-    const body = { issues, publish, audit: $("audit").checked, budget: $("budget").value, discard: OLD.length > 0, models: chosenModels() };
-    // 409: a sub-issue that would run has old work, which only the server can see.
-    const q = await post("/api/run", body).catch(e => {
-      if (e.status !== 409 || !confirm(e.message + "\n\nDiscard old work and run?")) throw e;
-      return post("/api/run", { ...body, discard: true });
-    });
+    const body = { issues, repo: SELECTED_REPO, language: SELECTED_LANGUAGE, publish, provider: SELECTED_AGENT, audit: $("audit").checked, transcripts: $("transcripts").checked, budget: $("budget").value, models: chosenModels() };
+    const q = await post("/api/run", body);
     renderQueue(q); $("msg").textContent = (q.notes || []).join(" · "); tick();
   }
   catch (e) { $("msg").textContent = "Cannot start: " + e.message; }
 });
 $("stopBtn").addEventListener("click", async () => {
   if (!confirm("Stop the running job and clear the queue?")) return;
-  try { renderQueue(await post("/api/stop")); } catch (e) { $("msg").textContent = "Cannot stop: " + e.message; }
+  try { renderQueue(await post(selectionURL("/api/stop"))); } catch (e) { $("msg").textContent = "Cannot stop: " + e.message; }
 });
 
 async function tick() {
   clearTimeout(TIMER);
   try {
     if (!EDGES.length) EDGES = await (await fetch("/api/graph")).json();
-    render(await (await fetch("/api/state")).json());
+    render(await (await fetch(SELECTED_REPO ? selectionURL("/api/state") : "/api/state")).json());
     await pollQueue();
   } catch (e) { $("line").textContent = "cannot reach the server: " + e; }
   TIMER = setTimeout(tick, RUNNING || BUSY ? 2000 : 10000); // nothing changes fast when no run is live
 }
+$("repoPath").value = DEFAULT_REPO;
+$("language").value = "auto";
+$("agent").value = DEFAULT_AGENT;
+if (DEFAULT_REPO) $("selectRepo").click();
+loadManagement();
 tick();
 </script>
 </body>
