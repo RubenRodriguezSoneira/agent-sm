@@ -160,6 +160,12 @@ func init() { // not a composite literal at package level: the step functions re
 	schema["properties"].(map[string]any)["issue_plan"] = proposal
 	b, _ := json.Marshal(schema)
 	steps[Plan].Schema = string(b)
+	for _, state := range []State{Plan, Investigate, Execute, Review} {
+		json.Unmarshal([]byte(steps[state].Schema), &schema)
+		schema["properties"].(map[string]any)["explanation"] = map[string]string{"type": "string"}
+		b, _ = json.Marshal(schema)
+		steps[state].Schema = string(b)
+	}
 }
 
 const (
@@ -359,7 +365,39 @@ type Stats struct {
 	Outcome       string         `json:"outcome"`       // ok, invalid, timeout or over-budget
 	Unit          string         `json:"unit"`
 	OK            bool           `json:"ok"`
-	Result        string         `json:"result"` // the structured output, first 1500 bytes
+	Result        string         `json:"result"` // a truncated excerpt of the structured output
+	Summary       string         `json:"summary,omitempty"`
+}
+
+// resultSummary extracts the explanation from a validated agent response.
+func resultSummary(state string, result []byte) string {
+	var r struct {
+		Explanation string   `json:"explanation"`
+		Objective   string   `json:"objective"`
+		Evidence    string   `json:"evidence"`
+		Summary     string   `json:"summary"`
+		Reasons     []string `json:"reasons"`
+	}
+	if json.Unmarshal(result, &r) != nil {
+		return ""
+	}
+	summary := r.Explanation
+	if strings.TrimSpace(summary) == "" {
+		switch state {
+		case "plan":
+			summary = r.Objective
+		case "investigate":
+			summary = r.Evidence
+		case "execute":
+			summary = r.Summary
+		case "review":
+			summary = strings.Join(r.Reasons, "\n")
+		}
+	}
+	if chars := []rune(summary); len(chars) > 4000 {
+		return string(chars[:4000]) + "... (truncated)"
+	}
+	return summary
 }
 
 func writeStats(st *Stats) {
@@ -606,6 +644,7 @@ func claudeAgent(c *Ctx, state State, prompt string, out any, transcript *agentT
 		logEvent(map[string]any{"event": "invalid-result", "err": err.Error()})
 		return Invalid
 	}
+	st.Summary = resultSummary(state.String(), structured)
 	return Ok
 }
 
@@ -681,11 +720,9 @@ func prepare(c *Ctx) Out {
 			logEvent(map[string]any{"event": "prepare", "err": err.Error()})
 			return Fail
 		}
-		if strings.HasPrefix(c.Base, "origin/") {
-			if out, err := sh(c.Repo, "git", "fetch", "--", "origin", strings.TrimPrefix(c.Base, "origin/")); err != nil {
-				logEvent(map[string]any{"event": "prepare", "err": "fetch base failed", "out": tail(out, 500)})
-				return Fail
-			}
+		if err := fetchBase(c.Repo, c.Base, "the issue's \"Base branch:\" line or the profile's \"base\" (SM_BASE)"); err != nil {
+			logEvent(map[string]any{"event": "prepare", "err": err.Error()})
+			return Fail
 		}
 		if out, err := sh(c.Repo, "git", "checkout", "-b", branch, c.Base); err != nil {
 			logEvent(map[string]any{"event": "prepare", "err": "branch", "out": tail(out, 500)})
@@ -730,13 +767,15 @@ func dispatch(c *Ctx, role, extra string) string {
 	if settings.Legacy {
 		project = fmt.Sprintf(" Ghidra copy: %s. Export: %s.", c.Ghidra, c.Export)
 	}
-	return fmt.Sprintf("Dispatch: you are the %s.%s Issue #%d. Scratch directory: %s.%s%s\n\n%s\n\nStart now.",
+	return fmt.Sprintf("Dispatch: you are the %s.%s Issue #%d. Scratch directory: %s.%s%s\n\n%s\n\n"+
+		"For a blocked, failed, escalated, or split result, include an explanation in one or two short plain-language sentences: why and what to do next, if known. Distinguish uncertainty from confirmed facts; do not invent a cause or remedy.\n\nStart now.",
 		role, project, c.Issue, c.Scratch, extra, notes, issueText(c)+c.Comments)
 }
 
 func plan(c *Ctx) Out {
 	var r struct {
 		Status             string
+		Explanation        string
 		Objective          string
 		Points             []string
 		PointsDerived      bool `json:"points_derived"`
@@ -771,10 +810,11 @@ func plan(c *Ctx) Out {
 
 func investigate(c *Ctx) Out {
 	var r struct {
-		Status    string
-		Evidence  string
-		Handoff   string
-		FitsOnePR bool `json:"fits_one_pr"`
+		Status      string
+		Explanation string
+		Evidence    string
+		Handoff     string
+		FitsOnePR   bool `json:"fits_one_pr"`
 	}
 	u := Unit{ID: "all", Title: c.Objective, Points: c.Points}
 	if len(c.Units) > 0 {
@@ -826,6 +866,7 @@ func execute(c *Ctx) Out {
 	}
 	var r struct {
 		Status      string
+		Explanation string
 		Summary     string
 		ClosesIssue bool `json:"closes_issue"`
 	}
@@ -958,8 +999,9 @@ func check(c *Ctx) Out {
 
 func review(c *Ctx) Out {
 	var r struct {
-		Verdict string
-		Reasons []string
+		Verdict     string
+		Explanation string
+		Reasons     []string
 	}
 	extra := taskText(c) + " Executor's summary: " + c.Summary + "\nFindings:\n" + c.Evidence +
 		"\nChecks: all passed.\nDiff (staged):\n" + c.Diff

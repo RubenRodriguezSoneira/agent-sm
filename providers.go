@@ -209,6 +209,7 @@ func copilotAgent(c *Ctx, state State, prompt string, out any, transcript *agent
 		return Invalid
 	}
 	st.Result = tail(string(result), 1500)
+	st.Summary = resultSummary(state.String(), result)
 	return Ok
 }
 

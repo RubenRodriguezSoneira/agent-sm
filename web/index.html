@@ -136,6 +136,10 @@
   .chip.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; font-weight: 600; }
   .chip.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; font-weight: 600; }
   .chip.run { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 600; }
+  .explanation { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16em; overflow: auto; }
+  .result-details { margin-top: 10px; }
+  .result-details summary { cursor: pointer; color: var(--mute); font-size: 13px; }
+  .result-details pre { margin-top: 6px; }
   pre { font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; background: var(--soft); border-radius: 8px; padding: 10px 12px; margin: 0; max-height: 340px; overflow: auto; }
 
   /* steps */
@@ -256,6 +260,16 @@ const BADOUT = ["fail", "blocked", "invalid", "split", "escalate", "timeout", "o
 const outCls = o => BADOUT.includes(o) ? "no" : (o === "more" ? "wait" : "ok");
 const exitCls = x => x === "ready" ? "good" : (x === "stopped" || x === "split" ? "warn" : "bad");
 const pretty = r => { try { return JSON.stringify(JSON.parse(r), null, 2); } catch { return r; } }; // a cut result is not valid JSON
+function resultExplanation(state, stats) {
+  if (stats.summary) return stats.summary;
+  try {
+    const r = JSON.parse(stats.result);
+    if (typeof r.explanation === "string" && r.explanation.trim()) return r.explanation;
+    if (state === "review" && Array.isArray(r.reasons)) return r.reasons.join("\n");
+    const value = r[{plan: "objective", investigate: "evidence", execute: "summary"}[state]];
+    return typeof value === "string" ? value : "";
+  } catch { return ""; } // older results may be truncated
+}
 function age(iso) {
   const m = (Date.now() - Date.parse(iso)) / 60000;
   return m < 60 ? Math.max(1, Math.round(m)) + "m ago" : m < 1440 ? Math.round(m / 60) + "h ago" : Math.round(m / 1440) + "d ago";
@@ -343,11 +357,16 @@ function render(data) {
     const n = taken[sel + "|" + e.out + "|" + e.to];
     return `<span class="chip${n ? " taken" : ""}${e.limit ? " limit" : ""}" title="${e.limit ? "only after the retry limit" : ""}">${e.out} &rarr; ${e.to}${e.exit ? " (ends the run)" : ""}${n > 1 ? " x" + n : ""}</span>`;
   }).join("");
-  const res = p.last && p.last.s && p.last.s.result;
+  const stats = p.last && p.last.s;
+  const res = stats && stats.result;
+  const explanation = stats && resultExplanation(sel, stats);
+  const failed = p.last && BADOUT.includes(p.last.out);
   put("detail", sel ? `<h3>${sel}</h3>
     <div class="mute">${p.model ? "agent step on " + esc(p.model) : (p.visits ? "program step, no agent" : "has not run in this run")}${p.visits ? " · ran " + p.visits + "x" : ""}${p.cost ? " · " + usage(p.cost) : ""}${p.unknown ? " + unknown" : ""}</div>
     <div class="sub">Where each result leads</div><div class="outs">${chips}</div>
-    ${res ? `<div class="sub">Last result</div><pre>${esc(pretty(res))}</pre>` : ""}` : '<div class="empty">No run yet.</div>');
+    ${explanation ? `<div class="sub">${failed ? "Agent's explanation" : "Last result"}</div><div class="explanation">${esc(explanation)}</div>`
+      : failed && stats ? `<div class="sub">Explanation unavailable</div><div class="mute">No readable explanation was recorded. Check the run events or saved transcript, if available.</div>` : ""}
+    ${res ? `<details class="result-details"><summary>Show raw result (may be truncated)</summary><pre>${esc(pretty(res))}</pre></details>` : ""}` : '<div class="empty">No run yet.</div>');
 
   $("stepCount").textContent = steps.length ? steps.length + " so far" : "";
   put("steps", steps.map((e, i) => {

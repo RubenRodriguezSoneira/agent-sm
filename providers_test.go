@@ -39,7 +39,7 @@ func TestResultValidation(t *testing.T) {
 	for _, raw := range []string{
 		`{}`, `{"verdict":"PASS"}`, `{"verdict":"UNKNOWN","reasons":[]}`,
 		`{"verdict":"PASS","reasons":null}`, `{"verdict":"PASS","reasons":[1]}`,
-		`{"verdict":"PASS","reasons":[],"extra":true}`, `{"verdict":"PASS","verdict":"REVISE","reasons":[]}`,
+		`{"verdict":"PASS","reasons":[],"extra":true}`, `{"verdict":"PASS","reasons":[],"objective":"unexpected"}`, `{"verdict":"PASS","verdict":"REVISE","reasons":[]}`,
 		`{"verdict":"PASS","reasons":[]} {}`, "```json\n{}\n```", `null`, `{"verdict":[],"reasons":[]}`,
 	} {
 		var out struct {
@@ -599,7 +599,7 @@ if [ "$PROVIDER" = "copilot" ]; then
   if [ "$FIXTURE_MODE" = "incomplete" ]; then
     echo '{"type":"assistant.message","data":{"content":"{}"}}'
   else
-    echo '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PASS\",\"reasons\":[]}"}}'
+    echo '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PASS\",\"reasons\":[\"reviewed\"],\"explanation\":\"Readable explanation\"}"}}'
   fi
   echo '{"type":"result","exitCode":0}'
 else
@@ -607,7 +607,7 @@ else
   if [ "$FIXTURE_MODE" = "unknown-usage" ]; then cost=""; fi
   subtype=success
   if [ "$FIXTURE_MODE" = "budget" ]; then subtype=error_max_budget_usd; fi
-  result='{"verdict":"PASS","reasons":[]}'
+  result='{"verdict":"PASS","reasons":["reviewed"],"explanation":"Readable explanation"}'
   if [ "$FIXTURE_MODE" = "incomplete" ]; then result='{}'; fi
   # A background task finishing resumes the session: an earlier, superseded result comes first.
   if [ "$FIXTURE_MODE" = "resumed" ]; then echo '{"type":"result","subtype":"success","is_error":false,"num_turns":45,"total_cost_usd":0.04,"structured_output":{"verdict":"FAIL","reasons":["early"]}}'; fi
@@ -621,8 +621,9 @@ if [ "$FIXTURE_MODE" = "failure" ]; then exit 1; fi
 				t.Setenv("FIXTURE_MODE", mode)
 				c := &Ctx{Repo: dir, Scratch: dir, RunBudget: runBudget}
 				var r struct {
-					Verdict string
-					Reasons []string
+					Verdict     string
+					Reasons     []string
+					Explanation string
 				}
 				got := agent(c, Review, "bounded test", &r)
 				want := Ok
@@ -641,8 +642,91 @@ if [ "$FIXTURE_MODE" = "failure" ]; then exit 1; fi
 				if mode == "resumed" && (r.Verdict != "PASS" || c.Cost != 0.1 || c.CostUnknown != 0) {
 					t.Fatalf("resumed session: verdict %q cost %v unknown %d; want last result, cumulative cost", r.Verdict, c.Cost, c.CostUnknown)
 				}
+				if got == Ok {
+					b, err := os.ReadFile(filepath.Join(dir, "stats.jsonl"))
+					var st Stats
+					if err != nil || json.Unmarshal(b, &st) != nil || st.Summary != "Readable explanation" {
+						t.Fatalf("missing readable result in stats: %s (%v)", b, err)
+					}
+				}
 			})
 		}
+	}
+}
+
+func TestResultSummaryFallback(t *testing.T) {
+	for _, tc := range []struct {
+		state, result, want string
+	}{
+		{"plan", `{"objective":"old reason"}`, "old reason"},
+		{"investigate", `{"evidence":"missing dependency"}`, "missing dependency"},
+		{"execute", `{"summary":"blocked on input"}`, "blocked on input"},
+		{"review", `{"reasons":["first","second"]}`, "first\nsecond"},
+		{"plan", `{"objective":"old reason","explanation":"concise reason"}`, "concise reason"},
+		{"plan", `...truncated`, ""},
+	} {
+		if got := resultSummary(tc.state, []byte(tc.result)); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.state, got, tc.want)
+		}
+	}
+	long, _ := json.Marshal(map[string]string{"explanation": strings.Repeat("é", 4001)})
+	if got := resultSummary("plan", long); got != strings.Repeat("é", 4000)+"... (truncated)" {
+		t.Fatal("long explanation was not bounded on character boundaries")
+	}
+}
+
+func TestRecoverResultSummaries(t *testing.T) {
+	scratch := t.TempDir()
+	transcripts := filepath.Join(scratch, "transcripts")
+	if err := os.Mkdir(transcripts, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plan := `{"status":"blocked","objective":"The dependency contract needs investigation.","points":["` + strings.Repeat("x", 1600) + `"]}`
+	for _, provider := range []string{"copilot", "claude"} {
+		t.Run(provider, func(t *testing.T) {
+			dir := filepath.Join(transcripts, provider+"-plan")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			output := copilotOutput(t, plan)
+			if provider == "claude" {
+				output = `{"type":"result","subtype":"success","structured_output":` + plan + "}\n"
+			}
+			writeFile(t, filepath.Join(dir, "stdout.log"), output, 0o600)
+			marshal := func(v any) json.RawMessage {
+				b, err := json.Marshal(v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return b
+			}
+			events := []json.RawMessage{
+				marshal(map[string]any{"event": "transcript", "state": "plan", "path": dir}),
+				marshal(map[string]any{"event": "agent", "stats": map[string]any{"state": "plan", "provider": provider, "result": tail(plan, 1500)}}),
+				marshal(map[string]any{"state": "plan", "out": "blocked"}),
+			}
+			recoverResultSummaries(scratch, events)
+			var e struct {
+				Stats Stats `json:"stats"`
+			}
+			if err := json.Unmarshal(events[1], &e); err != nil || e.Stats.Summary != "The dependency contract needs investigation." {
+				t.Fatalf("recovered event: %s (%v)", events[1], err)
+			}
+			if e.Stats.Result != tail(plan, 1500) {
+				t.Fatal("original result excerpt was changed")
+			}
+			// A later session without a transcript must not inherit the earlier explanation.
+			events = append(events, marshal(map[string]any{"event": "agent", "stats": map[string]any{"state": "plan", "provider": provider, "result": "..."}}))
+			recoverResultSummaries(scratch, events)
+			if strings.Contains(string(events[3]), "summary") {
+				t.Fatal("reused an earlier transcript for a later session")
+			}
+		})
+	}
+	outside := t.TempDir()
+	writeFile(t, filepath.Join(outside, "stdout.log"), copilotOutput(t, plan), 0o600)
+	if _, err := historicalTranscriptResult(scratch, outside, "copilot"); err == nil {
+		t.Fatal("accepted a transcript outside the run directory")
 	}
 }
 

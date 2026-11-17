@@ -209,6 +209,114 @@ func readLines(path string, keep int) []json.RawMessage {
 	return out
 }
 
+// recoverResultSummaries makes older truncated results readable when their transcripts still exist.
+func recoverResultSummaries(scratch string, events []json.RawMessage) {
+	type candidate struct {
+		index           int
+		path, provider  string
+		result, summary string
+	}
+	pending := map[string]string{}
+	last := map[string]candidate{}
+	for i, raw := range events {
+		var e struct {
+			Event, State, Path, Out string
+			Stats                   *struct {
+				State, Provider, Result, Summary string
+			}
+		}
+		if json.Unmarshal(raw, &e) != nil {
+			continue
+		}
+		switch {
+		case e.Event == "transcript":
+			pending[e.State] = e.Path
+		case e.Event == "agent" && e.Stats != nil:
+			s := e.Stats
+			last[s.State] = candidate{i, pending[s.State], s.Provider, s.Result, s.Summary}
+			delete(pending, s.State)
+		case e.State != "" && e.Out != "":
+			delete(pending, e.State)
+		}
+	}
+	for state, c := range last {
+		if c.summary != "" || c.path == "" || c.result == "" || json.Valid([]byte(c.result)) {
+			continue
+		}
+		result, err := historicalTranscriptResult(scratch, c.path, c.provider)
+		if err != nil {
+			continue
+		}
+		summary := resultSummary(state, result)
+		if summary == "" {
+			continue
+		}
+		var event map[string]json.RawMessage
+		var stats map[string]json.RawMessage
+		if json.Unmarshal(events[c.index], &event) != nil || json.Unmarshal(event["stats"], &stats) != nil {
+			continue
+		}
+		stats["summary"], _ = json.Marshal(summary)
+		event["stats"], _ = json.Marshal(stats)
+		events[c.index], _ = json.Marshal(event)
+	}
+}
+
+func historicalTranscriptResult(scratch, dir, provider string) ([]byte, error) {
+	root, err := filepath.EvalSymlinks(filepath.Join(scratch, "transcripts"))
+	if err != nil {
+		return nil, err
+	}
+	path, err := filepath.EvalSymlinks(filepath.Join(dir, "stdout.log"))
+	if err != nil {
+		return nil, err
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return nil, fmt.Errorf("transcript is outside run directory")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	const limit = 8 << 20
+	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > limit {
+		return nil, fmt.Errorf("transcript exceeds %d bytes", limit)
+	}
+	if provider == "copilot" {
+		return copilotResult(raw)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	var result json.RawMessage
+	for {
+		var event struct {
+			Type, Subtype string
+			IsError       bool            `json:"is_error"`
+			Structured    json.RawMessage `json:"structured_output"`
+		}
+		if err := decoder.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, err
+		}
+		if event.Type == "result" {
+			result = nil
+			if event.Subtype == "success" && !event.IsError {
+				result = event.Structured
+			}
+		}
+	}
+	if len(result) == 0 || !json.Valid(result) {
+		return nil, fmt.Errorf("transcript has no valid final result")
+	}
+	return result, nil
+}
+
 // latestRun is the newest run directory under root (by the mtime of its status.json or events.jsonl).
 func latestRun(root string) (dir, issue string) {
 	var best int64
@@ -321,7 +429,9 @@ func serve(issue, addr, repo string) error {
 		if b, err := os.ReadFile(filepath.Join(scratch, "status.json")); err == nil && json.Valid(b) {
 			status = b
 		}
-		json.NewEncoder(w).Encode(map[string]any{"issue": iss, "status": status, "events": readLines(events, 500)})
+		lines := readLines(events, 500)
+		recoverResultSummaries(scratch, lines)
+		json.NewEncoder(w).Encode(map[string]any{"issue": iss, "status": status, "events": lines})
 	})
 
 	// Starting and stopping runs use a selected local repository and the page's token.

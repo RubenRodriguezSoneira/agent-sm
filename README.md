@@ -339,8 +339,10 @@ the complete history; large installations should compact/split this state before
 
 - Web run data is stored under `<scratch-root>/repos/<repository-hash>/<issue>/`, with numbered retries in `attempt-1/`, `attempt-2/`, etc.
 - `<scratch>/events.jsonl`: structured step results, errors (including CLI stderr), agent sessions and the exit. If a scratch directory is reused, the old event log is renamed to `events-<date>-<time>.jsonl`, not deleted.
+- The run view shows the agent's explanation for each step, with its raw result excerpt expandable. Agents are asked for a short explanation and next step when blocked; it is their assessment, not a confirmed diagnosis. For older truncated results, the page can recover the original explanation from a saved transcript; if unavailable, it says so.
 - The scratch root is durable, so run history survives a reboot. Agents also write probe output (traces, dumps) there; delete an issue's directory when you no longer need it.
 - `<scratch>/status.json`: the running session's live state. `<scratch>/run.log`: output of a run started from the page.
+- `<scratch>/failures.jsonl`: page-started runs that failed before the agent started (issue read, `Base branch` metadata, base fetch, worktree), one JSON line each.
 - Transcripts are on by default. To turn them off, untick **Save transcripts** before Run, set `"transcripts": false` in a profile, or use `SM_TRANSCRIPTS=0`. Each agent call/retry gets a separate private directory at `<scratch>/transcripts/<provider>-<step>-<unique>/`; its path is recorded in `events.jsonl`.
   - `request.json`: exact CLI arguments (including prompts), working directory, schema and start time; no environment dump.
   - `stdout.log` / `stderr.log`: raw CLI streams captured before JSON validation, including malformed output. Claude's stdout includes its message/tool stream and native usage.
@@ -348,7 +350,7 @@ the complete history; large installations should compact/split this state before
   - `result.json`: agent-call outcome, finish time and any capture error. A logging failure prevents successful workflow continuation, even if the provider itself returned a valid result; provider usage statistics still describe that provider call.
   - Captures contain only messages exposed by the CLI, not hidden model reasoning. Cancellation, output limits, startup failure or disk errors can leave partial captures; a missing native session log is recorded explicitly. Transcripts are not reconstructed for past runs.
   - Transcripts can contain source code, secrets or sensitive tool output. Directories are private (`0700`), app-created files use `0600`, and nothing expires automatically. Review/delete them when no longer needed; Copilot also retains its original local session history separately. This does **not** enable Claude's permission-bypassing **permission audit**.
-- `agent-sm-stats.jsonl` (`SM_STATS`): one line per agent session. It is local output and is gitignored.
+- `agent-sm-stats.jsonl` (`SM_STATS`): one line per agent session, including the agent's explanation (up to 4,000 characters). It is local output and is gitignored.
 - `agent-sm stats [file]` summarizes usage and models by provider/state. The web UI follows the latest run; queue history is in memory and resets on restart, but saved run files remain available. There is no older-run picker yet.
 - `runs/`: archived attempts kept in the repo as evidence for the issues that cite them. Nothing writes there.
 

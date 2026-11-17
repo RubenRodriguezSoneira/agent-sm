@@ -515,6 +515,17 @@ esac
 	return repo
 }
 
+func TestFetchBaseExplainsMissingBranch(t *testing.T) {
+	repo := retryRepo(t)
+	if err := fetchBase(repo, "origin/main", "test"); err != nil {
+		t.Fatal(err)
+	}
+	err := fetchBase(repo, "origin/PUSH-9258", `issue #15's "Base branch:" line`)
+	if err == nil || !strings.Contains(err.Error(), `origin has no branch named "PUSH-9258"`) || !strings.Contains(err.Error(), `issue #15's "Base branch:" line`) {
+		t.Fatalf("unhelpful error: %v", err)
+	}
+}
+
 func TestWorktreeRetry(t *testing.T) {
 	repo := retryRepo(t)
 	r := &Runner{repo: repo}

@@ -215,6 +215,23 @@ func baseBranch() string {
 	return settings.Base
 }
 
+// fetchBase refreshes an origin/ base before branching from it; source says where the base came from.
+func fetchBase(repo, base, source string) error {
+	name, remote := strings.CutPrefix(base, "origin/")
+	if !remote {
+		return nil
+	}
+	out, err := sh(repo, "git", "fetch", "--", "origin", name)
+	if err == nil {
+		return nil
+	}
+	msg := fmt.Sprintf("cannot fetch base branch %q (from %s) from origin", name, source)
+	if strings.Contains(out, "couldn't find remote ref") {
+		msg += fmt.Sprintf(": origin has no branch named %q. Push that branch, or fix the base in %s", name, source)
+	}
+	return fmt.Errorf("%s. git: %s", msg, strings.TrimSpace(tail(out, 300)))
+}
+
 // suggestAllow builds an allow list from what a state really used, plus a small floor.
 func suggestAllow(state string, called, bash map[string]int) string {
 	set := map[string]bool{"Read": true, "Grep": true, "Glob": true}

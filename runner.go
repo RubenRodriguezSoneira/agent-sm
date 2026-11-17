@@ -148,11 +148,6 @@ func (r *Runner) worktreeAt(n int, base string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	if strings.HasPrefix(base, "origin/") {
-		if out, err := sh(r.repo, "git", "fetch", "--", "origin", strings.TrimPrefix(base, "origin/")); err != nil {
-			return "", "", fmt.Errorf("fetch base: %s", tail(out, 300))
-		}
-	}
 	if out, err := sh(r.repo, "git", "worktree", "add", "-b", branch, dir, base); err != nil {
 		return "", "", fmt.Errorf("git worktree add: %s", tail(out, 300))
 	}
@@ -220,44 +215,60 @@ func (r *Runner) runOne(j *Job) {
 	if j.Profile != nil {
 		p = *j.Profile
 	}
+	// Failures before the agent starts have no events.jsonl yet; keep them on disk so they survive a restart.
+	fail := func(msg string) {
+		r.set(func() { j.Err = msg })
+		dir := runScratch(j.Repo, j.Issue)
+		b, _ := json.Marshal(map[string]any{"t": time.Now().Format(time.RFC3339), "issue": j.Issue, "base": j.Base, "err": msg})
+		if os.MkdirAll(dir, 0o755) == nil {
+			if f, err := os.OpenFile(filepath.Join(dir, "failures.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+				f.Write(append(b, '\n'))
+				f.Close()
+			}
+		}
+	}
 	out, err := sh(r.repo, "gh", "issue", "view", strconv.Itoa(j.Issue), "--json", "body")
 	var issue struct{ Body string }
 	if err != nil || json.Unmarshal([]byte(out), &issue) != nil {
-		r.set(func() { j.Err = "cannot read issue metadata before creating worktree" })
+		fail(fmt.Sprintf("cannot read GitHub issue #%d before creating worktree: %s", j.Issue, strings.TrimSpace(tail(out, 300))))
 		return
 	}
 	meta, err := issueMetadata(issue.Body)
 	if err != nil {
-		r.set(func() { j.Err = err.Error() })
+		fail(fmt.Sprintf("issue #%d metadata: %v", j.Issue, err))
 		return
 	}
-	base := p.Base
+	base, source := p.Base, "the profile's \"base\" (or SM_BASE)"
 	if meta.Base != "" {
-		base = meta.Base
+		base, source = meta.Base, fmt.Sprintf("issue #%d's \"Base branch:\" line", j.Issue)
 	}
 	r.set(func() { j.Base = base })
+	if err := fetchBase(r.repo, base, source); err != nil {
+		fail(err.Error())
+		return
+	}
 	wt, branch, err := r.worktreeAt(j.Issue, base)
 	if err != nil {
-		r.set(func() { j.Err = err.Error() })
+		fail(err.Error())
 		return
 	}
 	r.set(func() { j.Worktree, j.Branch = wt, branch })
 	scratch := j.scratch()
 	if err := os.MkdirAll(scratch, 0o755); err != nil {
-		r.set(func() { j.Err = err.Error() })
+		fail(err.Error())
 		return
 	}
 	eventsPath := filepath.Join(scratch, "events.jsonl")
 	if _, err := os.Stat(eventsPath); err == nil {
 		archive := filepath.Join(scratch, "events-"+time.Now().Format("20060102-150405")+".jsonl")
 		if err := os.Rename(eventsPath, archive); err != nil {
-			r.set(func() { j.Err = err.Error() })
+			fail(err.Error())
 			return
 		}
 	}
 	logf, err := os.Create(filepath.Join(scratch, "run.log"))
 	if err != nil {
-		r.set(func() { j.Err = err.Error() })
+		fail(err.Error())
 		return
 	}
 	defer logf.Close()
@@ -266,7 +277,7 @@ func (r *Runner) runOne(j *Job) {
 	cmd.Stdout, cmd.Stderr = logf, logf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
-		r.set(func() { j.Err = err.Error() })
+		fail(err.Error())
 		return
 	}
 	r.set(func() { r.cmd = cmd })
