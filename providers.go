@@ -23,17 +23,19 @@ func agent(c *Ctx, state State, prompt string, out any) (result Out) {
 	var transcript *agentTranscript
 	if settings.Transcripts {
 		var err error
+		// Transcripts are diagnostics, on by default: a capture failure is logged and never
+		// changes the step's outcome, so a paid-for result is not thrown away.
 		transcript, err = newTranscript(c, state)
 		if err != nil {
 			logEvent(map[string]any{"event": "transcript-error", "err": err.Error()})
-			return Invalid
+			transcript = nil
+		} else {
+			defer func() {
+				if err := transcript.finish(result); err != nil {
+					logEvent(map[string]any{"event": "transcript-error", "path": transcript.dir, "err": err.Error()})
+				}
+			}()
 		}
-		defer func() {
-			if err := transcript.finish(result); err != nil {
-				logEvent(map[string]any{"event": "transcript-error", "path": transcript.dir, "err": err.Error()})
-				result = Invalid
-			}
-		}()
 	}
 	if settings.Provider == "claude" {
 		return claudeAgent(c, state, prompt, out, transcript)
@@ -135,7 +137,7 @@ func copilotAgent(c *Ctx, state State, prompt string, out any, transcript *agent
 	usagePath := filepath.Join(dir, "usage.json")
 	args := copilotArgs(state, prompt, usagePath, limit)
 	if transcript != nil {
-		args = append(args, "--session-id", transcript.sessionID, "--sync-session=off")
+		args = append(args, "--session-id", transcript.sessionID, "--no-remote-export")
 		if err := transcript.request(args, state, cancel); err != nil {
 			logEvent(map[string]any{"event": "transcript-error", "err": err.Error()})
 			return Invalid
