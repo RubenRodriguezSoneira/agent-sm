@@ -1,1 +1,0 @@
-Runtime checks: run verification/v7-trace/status_probe.py yourself for at least two of the statuses the diff cites and confirm the trace hash matches the one in the docs. A hash that does not reproduce is REVISE.
