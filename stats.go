@@ -47,7 +47,7 @@ func report(jsonl []byte) string {
 			if st.Killed {
 				killed++
 			}
-			if st.UsageUnknown || st.Killed {
+			if st.UsageUnknown || st.Killed && !credits { // a stopped Copilot session still reports its usage
 				unknown++
 			} else if credits && st.Credits != nil {
 				cost += *st.Credits
@@ -81,8 +81,8 @@ func report(jsonl []byte) string {
 		}
 		n := len(list)
 		if credits {
-			fmt.Fprintf(&b, "%s: %d sessions, %.3f known credits, %d unknown-usage sessions; tool/turn telemetry unavailable\n",
-				state, n, cost, unknown)
+			fmt.Fprintf(&b, "%s: %d sessions, %.3f known credits, %d unknown-usage sessions, avg turns %.1f\n",
+				state, n, cost, unknown, float64(turns)/float64(n))
 		} else {
 			fmt.Fprintf(&b, "%s: %d sessions, $%.3f known total, %d unknown-usage sessions, avg cache-create %d, cache-read %d, output %d, turns %.1f\n",
 				state, n, cost, unknown, create/n, read/n, out/n, float64(turns)/float64(n))
@@ -96,10 +96,7 @@ func report(jsonl []byte) string {
 		}
 		sort.Strings(ml)
 		fmt.Fprintf(&b, "  models: %s\n", strings.Join(ml, ", "))
-		if credits {
-			continue
-		}
-		if killed > 0 {
+		if killed > 0 && !credits {
 			fmt.Fprintf(&b, "  note: %d killed sessions reported no cost; the total above leaves them out\n", killed)
 		}
 		if n < thinEvidence {
@@ -117,17 +114,28 @@ func report(jsonl []byte) string {
 				used = append(used, fmt.Sprintf("%s x%d", t, called[t]))
 			}
 		}
+		if credits { // Copilot lists no tools up front; its shell policy is the profile's commands
+			for t, c := range called {
+				used = append(used, fmt.Sprintf("%s x%d", t, c))
+			}
+		}
 		sort.Strings(unused)
 		sort.Strings(used)
-		fmt.Fprintf(&b, "  tools listed %d, used: %s\n", len(listed), strings.Join(used, ", "))
+		if credits {
+			fmt.Fprintf(&b, "  tools used: %s\n", strings.Join(used, ", "))
+		} else {
+			fmt.Fprintf(&b, "  tools listed %d, used: %s\n", len(listed), strings.Join(used, ", "))
+		}
 		var bl []string
 		for k, c := range bash {
 			bl = append(bl, fmt.Sprintf("%s x%d", k, c))
 		}
 		sort.Strings(bl)
 		fmt.Fprintf(&b, "  bash commands: %s\n", strings.Join(bl, ", "))
-		fmt.Fprintf(&b, "  ALLOW suggestion: %s\n", suggestAllow(strings.TrimPrefix(state, "claude/"), called, bash))
-		fmt.Fprintf(&b, "  TRIM tools (listed, never called) %d: %s\n", len(unused), strings.Join(unused, ", "))
+		if !credits {
+			fmt.Fprintf(&b, "  ALLOW suggestion: %s\n", suggestAllow(strings.TrimPrefix(state, "claude/"), called, bash))
+			fmt.Fprintf(&b, "  TRIM tools (listed, never called) %d: %s\n", len(unused), strings.Join(unused, ", "))
+		}
 
 		if len(denied) > 0 {
 			var dn []string
@@ -141,6 +149,9 @@ func report(jsonl []byte) string {
 			}
 		}
 
+		if credits {
+			continue // Copilot sessions load no MCP servers
+		}
 		var mcpUnused []string
 		for m := range mcpLoaded {
 			if !mcpCalled(m, called) {

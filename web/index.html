@@ -210,7 +210,7 @@
       <label>Limit per step <span id="budgetUnit"></span> <input class="field" type="number" id="budget" value="2" min="0.01" step="0.01" required></label>
       <span class="mute" id="runBudget"></span>
       <label title="Save prompts, responses and available tool messages locally. May contain sensitive code or output."><input type="checkbox" id="transcripts"> Save transcripts</label>
-      <label title="Claude only: bypass permission approvals to measure tool use. Not transcript logging."><input type="checkbox" id="audit"> permission audit</label>
+      <label title="Allow any shell command except outward ones, to measure tool use (Claude bypasses its permission checks; not allowed for Claude in service mode). Not transcript logging."><input type="checkbox" id="audit"> permission audit</label>
       <button class="btn danger" id="stopBtn" disabled>Stop</button>
       <button class="btn primary" id="runBtn" disabled>Run</button>
     </div>
@@ -371,7 +371,7 @@ function render(data) {
   $("stepCount").textContent = steps.length ? steps.length + " so far" : "";
   put("steps", steps.map((e, i) => {
     const s = e.s || {}, a = !!e.s;
-    const telemetry = s.provider !== "copilot";
+    const telemetry = s.provider !== "copilot" || s.tool_calls != null; // older Copilot runs had no tool telemetry
     const calls = telemetry ? Object.values(s.tool_calls || {}).reduce((x, y) => x + y, 0) : "unknown";
     const den = telemetry ? (s.permission_denials || 0) : "unknown";
     const w = a && total ? Math.round(100 * (stepUsage(s) || 0) / total) : 0;
@@ -450,8 +450,6 @@ function renderQueue(q) {
   if (first || providerChanged) $("budget").value = q.session_limit;
   if (first) $("transcripts").checked = !!q.transcripts;
   if (first || providerChanged) $("audit").checked = !!q.audit;
-  $("audit").disabled = q.provider !== "claude";
-  if ($("audit").disabled) $("audit").checked = false;
   const chips = [];
   if (q.running) chips.push(`<span class="chip run" title="${esc(q.running.branch || "")}">running #${q.running.issue}</span>`);
   (q.queued || []).forEach(j => chips.push(`<span class="chip warn">queued #${j.issue}</span>`));

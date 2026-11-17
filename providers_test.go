@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	copilot "github.com/github/copilot-sdk/go"
+	"github.com/github/copilot-sdk/go/rpc"
 )
 
 func useProfile(t *testing.T, p Profile) {
@@ -33,6 +38,39 @@ func copilotOutput(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return string(b) + "\n" + "{\"type\":\"result\",\"exitCode\":0}\n"
+}
+
+func fakeCopilot(t *testing.T, fn func(context.Context, copilotRequest) (copilotReply, error)) {
+	t.Helper()
+	old := copilotSession
+	copilotSession = fn
+	t.Cleanup(func() { copilotSession = old })
+}
+
+func copilotCredits(credits float64) *rpc.UsageGetMetricsResult {
+	nano, complete := credits*1e9, rpc.AiCreditsStatusComplete
+	return &rpc.UsageGetMetricsResult{TotalNanoAiu: &nano, AiCreditsStatus: &complete,
+		ModelMetrics: map[string]rpc.UsageMetricsModelMetric{"actual-model": {}}}
+}
+
+// copilotFixture plays planner, executor and reviewer for a child agent-sm in TestQueuedCLI.
+func copilotFixture(_ context.Context, req copilotRequest) (copilotReply, error) {
+	req.Event(copilot.SessionEvent{Data: &copilot.AssistantMessageData{Content: "fixture session"}})
+	reply := copilotReply{Usage: copilotCredits(.1)}
+	switch role := req.System + req.Prompt; {
+	case strings.Contains(role, "You are the planner"):
+		reply.Content = `{"status":"plan","objective":"deliver file","points":["file exists"],"points_derived":false,"files":["outcome.txt"],"verification":"default","needs_investigation":false,"fits_one_pr":true,"units":[]}`
+	case strings.Contains(role, "You are the implementation"):
+		if err := os.WriteFile(filepath.Join(req.Repo, "outcome.txt"), []byte("delivered\n"), 0o644); err != nil {
+			return reply, err
+		}
+		reply.Content = `{"status":"done","summary":"delivered file","closes_issue":true}`
+	case strings.Contains(role, "You independently review"):
+		reply.Content = `{"verdict":"PASS","reasons":["file verified"]}`
+	default:
+		return reply, errors.New("unknown role")
+	}
+	return reply, nil
 }
 
 func TestResultValidation(t *testing.T) {
@@ -110,7 +148,7 @@ func TestQueuedProfile(t *testing.T) {
 		t.Fatal("queue mutated the server's profile")
 	}
 	for _, req := range []runRequest{
-		{Audit: true}, {Budget: "0"}, {Budget: "99.99"}, {Budget: "NaN"},
+		{Budget: "0"}, {Budget: "99.99"}, {Budget: "NaN"},
 		{Models: map[string]string{"check": "model"}},
 	} {
 		if _, err := queuedProfile(req); err == nil {
@@ -456,25 +494,78 @@ func TestSnapshotDoesNotReadChangedEnvironment(t *testing.T) {
 }
 
 func TestCopilotPolicy(t *testing.T) {
+	repo := t.TempDir()
+	outside := t.TempDir()
+	t.Setenv("TMPDIR", t.TempDir()) // tool output spill dir; distinct from outside
+	if err := os.Symlink(outside, filepath.Join(repo, "escape")); err != nil {
+		t.Fatal(err)
+	}
 	p := defaultProfile("copilot")
 	p.Commands["execute"] = []string{"dotnet test"}
 	useProfile(t, p)
-	execute := strings.Join(copilotArgs(Execute, "task", "/tmp/usage", 1), "\n")
-	review := strings.Join(copilotArgs(Review, "task", "/tmp/usage", 1), "\n")
-	if !strings.Contains(execute, "--allow-tool=shell(dotnet test:*)") ||
-		strings.Contains(review, "--allow-tool=shell(dotnet test:*)") ||
-		!strings.Contains(review, "--deny-tool=write") ||
-		!strings.Contains(execute, "--deny-tool=shell(rtk proxy git push:*)") {
-		t.Fatal("incorrect role-specific command policy")
+	bash := func(cmd string) map[string]any { return map[string]any{"command": cmd} }
+	path := func(p string) map[string]any { return map[string]any{"path": p} }
+	type call struct {
+		state State
+		tool  string
+		args  map[string]any
+		want  bool
 	}
-	for _, bad := range []string{"--allow-all", "--trust-folder", "--allow-tool=shell(dotnet:*)"} {
-		if strings.Contains(execute, bad) {
-			t.Errorf("overbroad policy: %s", bad)
-		}
-		if !strings.Contains(execute, "--output-format=json") || strings.Contains(execute, "--silent") {
-			t.Fatal("structured responses must not use the CLI's rendered text output")
+	normal := []call{
+		{Execute, "bash", bash("dotnet test --no-build"), true},
+		{Review, "bash", bash("dotnet test"), false},
+		{Execute, "bash", bash("dotnet build"), false},
+		{Review, "bash", bash("git diff --stat && rtk git log -3 | head -5"), true},
+		{Review, "bash", bash("rtk proxy grep -rn 'a; git push' . 2>/dev/null"), true},
+		{Review, "bash", bash("git diff; git push"), false},
+		{Review, "bash", bash("git diff && rtk proxy git push"), false},
+		{Review, "bash", bash("git diff $(git push)"), false},
+		{Review, "bash", bash("git diff `git push`"), false},
+		{Review, "bash", bash("echo x > file"), false},
+		{Review, "bash", bash("grep x . & git push"), false},
+		{Review, "bash", bash("echo \\' ; git push ; \\'"), false},
+		{Review, "bash", bash("echo \"<<EOF\"\ngit push\nEOF"), false},
+		{Review, "bash", bash("cat <<'EOF'\ngit push\nEOF"), true},
+		{Review, "bash", bash("PATH=/tmp grep x"), false},
+		{Review, "bash", bash("(git push)"), false},
+		{Review, "bash", bash("for f in a b; do grep x $f; done"), true},
+		{Review, "bash", bash("echo 'unterminated"), false},
+		{Review, "view", path("main.go"), true},
+		{Review, "view", path(filepath.Join(os.TempDir(), "copilot-tool-output.txt")), true},
+		{Review, "view", path(filepath.Join(outside, "secret")), false},
+		{Review, "view", path("escape/secret"), false},
+		{Review, "grep", map[string]any{"pattern": "x"}, true},
+		{Review, "edit", path("main.go"), false},
+		{Execute, "edit", path("main.go"), true},
+		{Execute, "create", path("../elsewhere.go"), false},
+		{Execute, "create", path(filepath.Join(os.TempDir(), "x.go")), false},
+		{Execute, "web_fetch", map[string]any{"url": "https://example.com"}, false},
+		{Execute, "task", nil, false},
+	}
+	check := func(calls []call) {
+		t.Helper()
+		for _, c := range calls {
+			if got, why := copilotDecision(c.state, repo, c.tool, c.args); got != c.want {
+				t.Errorf("%v %s %v = %v (%s), want %v", c.state, c.tool, c.args, got, why, c.want)
+			} else if !got && why == "" {
+				t.Errorf("%s %v denied without a reason", c.tool, c.args)
+			}
 		}
 	}
+	check(normal)
+	p.Audit = true
+	useProfile(t, p)
+	check([]call{
+		{Review, "bash", bash("make lint && npm test"), true},
+		{Review, "bash", bash("git push"), false},
+		{Review, "bash", bash("rm -fr build"), false},
+		{Review, "bash", bash("rm -f build.log"), true},
+		{Review, "bash", bash("bash -c 'git push'"), false},
+		{Review, "bash", bash("echo x | xargs git push"), false},
+		{Review, "view", path(filepath.Join(outside, "notes")), true},
+		{Review, "edit", path("main.go"), false},
+		{Execute, "create", path(filepath.Join(outside, "x")), false},
+	})
 	t.Setenv("COPILOT_ALLOW_ALL", "true")
 	t.Setenv("JIRA_API_TOKEN", "test-token")
 	env := strings.Join(cleanAgentEnv(), "\n")
@@ -491,18 +582,6 @@ func TestGenericPrompts(t *testing.T) {
 			if strings.Contains(prompt, legacy) {
 				t.Errorf("%v contains %s", state, legacy)
 			}
-		}
-	}
-}
-
-func TestCopilotUsage(t *testing.T) {
-	credits, model, err := copilotUsage([]byte(`{"totalNanoAiu":250000000,"modelMetrics":{"actual-model":{}}}`))
-	if err != nil || credits != .25 || model != "actual-model" {
-		t.Fatalf("%v %s %v", credits, model, err)
-	}
-	for _, raw := range []string{`{}`, `{"totalNanoAiu":null}`, `{"totalNanoAiu":-1}`, `invalid`} {
-		if _, _, err := copilotUsage([]byte(raw)); err == nil {
-			t.Errorf("accepted unknown usage %s", raw)
 		}
 	}
 }
@@ -571,9 +650,9 @@ func TestCopilotResult(t *testing.T) {
 
 func TestProviderResults(t *testing.T) {
 	for _, provider := range []string{"claude", "copilot"} {
-		for _, mode := range []string{"valid", "incomplete", "failure", "unknown-usage", "budget", "resumed"} {
-			if mode == "resumed" && provider == "copilot" {
-				continue // Claude-only stream shape
+		for _, mode := range []string{"valid", "incomplete", "failure", "unknown-usage", "budget", "exhausted", "resumed"} {
+			if mode == "resumed" && provider == "copilot" || mode == "exhausted" && provider == "claude" {
+				continue // provider-specific shapes
 			}
 			t.Run(provider+"/"+mode, func(t *testing.T) {
 				dir := t.TempDir()
@@ -584,25 +663,23 @@ func TestProviderResults(t *testing.T) {
 					p.SessionLimit, runBudget = 100, 500
 				}
 				useProfile(t, p)
+				fakeCopilot(t, func(context.Context, copilotRequest) (copilotReply, error) {
+					reply := copilotReply{Content: `{"verdict":"PASS","reasons":["reviewed"],"explanation":"Readable explanation"}`, Usage: copilotCredits(.1)}
+					switch mode {
+					case "incomplete":
+						reply.Content = "{}"
+					case "failure":
+						return reply, errors.New("session failed")
+					case "unknown-usage":
+						reply.Usage = nil
+					case "budget":
+						reply.Usage = copilotCredits(100)
+					case "exhausted":
+						reply.OverBudget, reply.Content = true, ""
+					}
+					return reply, nil
+				})
 				writeFile(t, filepath.Join(dir, provider), `#!/bin/sh
-usage=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--usage-output-file" ]; then shift; usage="$1"; fi
-  shift
-done
-if [ "$PROVIDER" = "copilot" ]; then
-  if [ "$FIXTURE_MODE" != "unknown-usage" ]; then
-    amount=100000000
-    if [ "$FIXTURE_MODE" = "budget" ]; then amount=100000000000; fi
-    printf '{"totalNanoAiu":%s,"modelMetrics":{"actual-model":{}}}' "$amount" > "$usage"
-  fi
-  if [ "$FIXTURE_MODE" = "incomplete" ]; then
-    echo '{"type":"assistant.message","data":{"content":"{}"}}'
-  else
-    echo '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PASS\",\"reasons\":[\"reviewed\"],\"explanation\":\"Readable explanation\"}"}}'
-  fi
-  echo '{"type":"result","exitCode":0}'
-else
   cost=',"total_cost_usd":0.1'
   if [ "$FIXTURE_MODE" = "unknown-usage" ]; then cost=""; fi
   subtype=success
@@ -612,12 +689,10 @@ else
   # A background task finishing resumes the session: an earlier, superseded result comes first.
   if [ "$FIXTURE_MODE" = "resumed" ]; then echo '{"type":"result","subtype":"success","is_error":false,"num_turns":45,"total_cost_usd":0.04,"structured_output":{"verdict":"FAIL","reasons":["early"]}}'; fi
   printf '{"type":"result","subtype":"%s","is_error":false%s,"structured_output":%s}\n' "$subtype" "$cost" "$result"
-fi
 if [ "$FIXTURE_MODE" = "failure" ]; then exit 1; fi
 `, 0o755)
 				t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 				t.Setenv("SM_STATS", filepath.Join(dir, "stats.jsonl"))
-				t.Setenv("PROVIDER", provider)
 				t.Setenv("FIXTURE_MODE", mode)
 				c := &Ctx{Repo: dir, Scratch: dir, RunBudget: runBudget}
 				var r struct {
@@ -630,7 +705,7 @@ if [ "$FIXTURE_MODE" = "failure" ]; then exit 1; fi
 				if mode == "incomplete" || mode == "failure" {
 					want = Invalid
 				}
-				if mode == "budget" {
+				if mode == "budget" || mode == "exhausted" {
 					want = OverBudget
 				}
 				if got != want {
@@ -739,7 +814,7 @@ func TestAuditDefault(t *testing.T) {
 		{"copilot default", `{"provider":"copilot","checks":["true"]}`, "-", false, false},
 		{"profile off", `{"provider":"claude","checks":["true"],"audit":false}`, "-", false, false},
 		{"env off", `{"provider":"claude","checks":["true"]}`, "0", false, false},
-		{"env on copilot", `{"provider":"copilot","checks":["true"]}`, "1", false, true},
+		{"env on copilot", `{"provider":"copilot","checks":["true"]}`, "1", true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "profile.json")
@@ -813,11 +888,8 @@ func TestTranscriptConfiguration(t *testing.T) {
 }
 
 func TestAgentTranscripts(t *testing.T) {
-	for _, provider := range []string{"claude", "copilot"} {
-		for _, mode := range []string{"disabled", "valid", "malformed", "failure", "startup", "timeout", "missing-messages"} {
-			if provider == "claude" && mode == "missing-messages" {
-				continue
-			}
+	for _, provider := range []string{"claude"} { // Copilot: TestCopilotSession
+		for _, mode := range []string{"disabled", "valid", "malformed", "failure", "startup", "timeout"} {
 			t.Run(provider+"/"+mode, func(t *testing.T) {
 				dir, scratch := t.TempDir(), t.TempDir()
 				p := defaultProfile(provider)
@@ -827,22 +899,6 @@ func TestAgentTranscripts(t *testing.T) {
 				}
 				useProfile(t, p)
 				writeFile(t, filepath.Join(dir, provider), `#!/bin/sh
-usage=""
-session=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --usage-output-file) shift; usage="$1";;
-    --session-id) shift; session="$1";;
-  esac
-  shift
-done
-if [ -n "$usage" ]; then
-  printf '{"totalNanoAiu":100000000,"modelMetrics":{"fixture":{}}}' > "$usage"
-fi
-if [ -n "$session" ] && [ "$SM_TEST_MODE" != "missing-messages" ]; then
-  mkdir -p "$COPILOT_HOME/session-state/$session"
-  printf '%s' "$SM_TEST_MESSAGES" > "$COPILOT_HOME/session-state/$session/events.jsonl"
-fi
 printf '%s' "$SM_TEST_STDOUT"
 printf 'diagnostic\nsecond line\n' >&2
 if [ "$SM_TEST_MODE" = "timeout" ]; then sleep 300; fi
@@ -852,28 +908,17 @@ if [ "$SM_TEST_MODE" = "failure" ]; then exit 1; fi
 					writeFile(t, filepath.Join(dir, provider), "#!/agent-sm-missing-interpreter\n", 0o755)
 				}
 				t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
-				t.Setenv("COPILOT_HOME", filepath.Join(dir, "copilot-home"))
 				t.Setenv("SM_STATS", filepath.Join(dir, "stats.jsonl"))
 				t.Setenv("SM_TEST_MODE", mode)
 				t.Setenv("SM_TEST_SECRET", "must-not-dump-environment")
-				messages := "{\"type\":\"assistant.message\",\"data\":{\"content\":\"tool discussion\"}}\n{\"type\":\"tool.execution_complete\",\"data\":{\"result\":\"tool output\"}}\n"
-				t.Setenv("SM_TEST_MESSAGES", messages)
-				raw := "{\"verdict\":\"PASS\",\"reasons\":[]}\n"
+				result := `{"verdict":"PASS","reasons":[]}`
 				if mode == "malformed" {
-					raw = "{\"verdict\":\"PASS\",\"reasons\":[\"raw\nnewline\"]}\n"
+					result = `{"verdict":"PASS"}`
 				}
-				if provider == "copilot" {
-					raw = copilotOutput(t, raw)
-				} else {
-					result := `{"verdict":"PASS","reasons":[]}`
-					if mode == "malformed" {
-						result = `{"verdict":"PASS"}`
-					}
-					raw = "unparseable line\n" +
-						"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"working\"}]}}\n" +
-						"{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"tool output\"}]}}\n" +
-						"{\"type\":\"result\",\"is_error\":false,\"total_cost_usd\":0.1,\"structured_output\":" + result + "}\n"
-				}
+				raw := "unparseable line\n" +
+					"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"working\"}]}}\n" +
+					"{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"tool output\"}]}}\n" +
+					"{\"type\":\"result\",\"is_error\":false,\"total_cost_usd\":0.1,\"structured_output\":" + result + "}\n"
 				stderr := "diagnostic\nsecond line\n"
 				if mode == "startup" {
 					raw, stderr = "", ""
@@ -886,15 +931,11 @@ if [ "$SM_TEST_MODE" = "failure" ]; then exit 1; fi
 				for attempt := 0; attempt < 2; attempt++ {
 					got := agent(c, Review, "exact prompt\nwith newline", new(any))
 					want := Ok
-					// missing-messages stays Ok: a capture gap is logged, never fails the step.
 					if mode == "malformed" || mode == "failure" || mode == "startup" {
 						want = Invalid
 					} else if mode == "timeout" {
-						want = Timeout
-						if provider == "claude" {
-							// A complete structured result was emitted before cancellation.
-							want = Invalid
-						}
+						// A complete structured result was emitted before cancellation.
+						want = Invalid
 					}
 					if got != want {
 						t.Fatalf("attempt %d = %s, want %s", attempt, got, want)
@@ -946,25 +987,6 @@ if [ "$SM_TEST_MODE" = "failure" ]; then exit 1; fi
 						result, err := os.ReadFile(filepath.Join(capture, "result.json"))
 						if err != nil || !strings.Contains(string(result), `"outcome": "`+want.String()+`"`) {
 							t.Fatalf("capture result = %s, %v", result, err)
-						}
-						if provider == "copilot" {
-							if !strings.Contains(string(request), "--no-remote-export") || strings.Contains(string(request), "--share") {
-								t.Fatal("transcript enabled remote sharing")
-							}
-							if mode == "missing-messages" || mode == "startup" {
-								if !strings.Contains(string(result), "messages_error") {
-									t.Fatalf("missing messages not reported: %s", result)
-								}
-								continue
-							}
-							b, err := os.ReadFile(filepath.Join(capture, "messages.jsonl"))
-							if err != nil || string(b) != messages {
-								t.Fatalf("native messages changed: %q, %v", b, err)
-							}
-							b, err = os.ReadFile(filepath.Join(capture, "usage.json"))
-							if err != nil || !strings.Contains(string(b), `"totalNanoAiu":100000000`) {
-								t.Fatalf("native usage missing: %s, %v", b, err)
-							}
 						}
 					}
 				}
@@ -1021,30 +1043,21 @@ func TestCopilotStepCreditLimit(t *testing.T) {
 	for _, tc := range []struct {
 		name                 string
 		session, total, used float64
-		wantLimit            string
+		wantLimit            float64 // 0: Copilot must not start
 	}{
-		{"unlimited total", 100, 0, 0, "100"},
-		{"remaining above minimum", 200, 500, 375, "125"},
-		{"remaining at minimum", 100, 500, 400, "100"},
-		{"remaining below minimum", 100, 500, 400.01, ""},
-		{"invalid session limit", 99, 0, 0, ""},
+		{"unlimited total", 100, 0, 0, 100},
+		{"remaining above minimum", 200, 500, 375, 125},
+		{"remaining at minimum", 100, 500, 400, 100},
+		{"remaining below minimum", 100, 500, 400.01, 0},
+		{"invalid session limit", 99, 0, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			capture := filepath.Join(dir, "limit")
-			writeFile(t, filepath.Join(dir, "copilot"), `#!/bin/sh
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --max-ai-credits) shift; printf '%s' "$1" > "$SM_TEST_CAPTURE";;
-    --usage-output-file) shift; usage="$1";;
-  esac
-  shift
-done
-printf '{"totalNanoAiu":100000000,"modelMetrics":{}}' > "$usage"
-printf '%s\n' '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PASS\",\"reasons\":[]}"}}' '{"type":"result","exitCode":0}'
-`, 0o755)
-			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-			t.Setenv("SM_TEST_CAPTURE", capture)
+			var passed float64
+			fakeCopilot(t, func(_ context.Context, req copilotRequest) (copilotReply, error) {
+				passed = req.Limit
+				return copilotReply{Content: `{"verdict":"PASS","reasons":[]}`, Usage: copilotCredits(.1)}, nil
+			})
 			t.Setenv("SM_STATS", filepath.Join(dir, "stats.jsonl"))
 			oldEvents := eventsPath
 			eventsPath = filepath.Join(dir, "events.jsonl")
@@ -1058,12 +1071,9 @@ printf '%s\n' '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PAS
 				Reasons []string
 			}
 			outcome := agent(c, Review, "credit limit test", &result)
-			if tc.wantLimit == "" {
-				if outcome != OverBudget {
-					t.Fatalf("outcome = %v, want over-budget", outcome)
-				}
-				if _, err := os.Stat(capture); !os.IsNotExist(err) {
-					t.Fatal("Copilot started with less than 100 credits")
+			if tc.wantLimit == 0 {
+				if outcome != OverBudget || passed != 0 {
+					t.Fatalf("outcome = %v, started with limit %v; want over-budget before starting", outcome, passed)
 				}
 				b, err := os.ReadFile(eventsPath)
 				if err != nil || !strings.Contains(string(b), "at least 100 AI credits") {
@@ -1071,9 +1081,140 @@ printf '%s\n' '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PAS
 				}
 				return
 			}
-			b, err := os.ReadFile(capture)
-			if outcome != Ok || err != nil || string(b) != tc.wantLimit {
-				t.Fatalf("outcome = %v, passed limit = %s (%v); want %s", outcome, b, err, tc.wantLimit)
+			if outcome != Ok || passed != tc.wantLimit {
+				t.Fatalf("outcome = %v, passed limit = %v; want %v", outcome, passed, tc.wantLimit)
+			}
+		})
+	}
+}
+
+// TestCopilotStrictSchema: Copilot's response_format needs every property required; optional
+// fields travel as null and must come back as omitted, without loosening required ones.
+func TestCopilotStrictSchema(t *testing.T) {
+	for _, state := range []State{Plan, Investigate, Execute, Review} {
+		var schema map[string]any
+		json.Unmarshal([]byte(steps[state].Schema), &schema)
+		var check func(string, map[string]any)
+		check = func(at string, s map[string]any) {
+			if items, ok := s["items"].(map[string]any); ok {
+				check(at+"[]", items)
+			}
+			props, _ := s["properties"].(map[string]any)
+			if req, _ := s["required"].([]any); len(req) != len(props) {
+				t.Errorf("%v %s: required %v for %d properties", state, at, req, len(props))
+			}
+			for k, v := range props {
+				if p, _ := v.(map[string]any); p["anyOf"] == nil {
+					check(at+"."+k, p)
+				} else {
+					check(at+"."+k, p["anyOf"].([]any)[0].(map[string]any))
+				}
+			}
+		}
+		check("", strictSchema(schema))
+	}
+	plan := `{"status":"plan","objective":"o","points":["p"],"points_derived":false,"files":[],"verification":"v",` +
+		`"needs_investigation":false,"fits_one_pr":true,"units":[],"explanation":null,` +
+		`"issue_plan":{"id":"x","items":[{"id":"a","title":"t","body":"b","kind":"task","number":null,"labels":null}]}}`
+	if err := validateResult(dropNulls([]byte(plan)), steps[Plan].Schema, new(any)); err != nil {
+		t.Fatalf("optional nulls rejected: %v", err)
+	}
+	if err := validateResult(dropNulls([]byte(`{"verdict":"PASS","reasons":null}`)), steps[Review].Schema, new(any)); err == nil {
+		t.Fatal("null required field accepted")
+	}
+	if got := string(dropNulls([]byte(`{"a":null,"a":1}`))); got != `{"a":null,"a":1}` {
+		t.Fatalf("duplicate keys rewritten to %s", got)
+	}
+}
+
+// TestCopilotSession: what an SDK session reports reaches stats, progress and the transcript,
+// and every tool call goes through agent-sm's policy.
+func TestCopilotSession(t *testing.T) {
+	for _, mode := range []string{"valid", "timeout"} {
+		t.Run(mode, func(t *testing.T) {
+			dir, scratch := t.TempDir(), t.TempDir()
+			p := defaultProfile("copilot")
+			p.Transcripts = true
+			if mode == "timeout" {
+				p.TimeoutMinutes = .001
+			}
+			useProfile(t, p)
+			t.Setenv("SM_STATS", filepath.Join(dir, "stats.jsonl"))
+			t.Setenv("SM_TEST_SECRET", "must-not-dump-environment")
+			oldEvents := eventsPath
+			eventsPath = filepath.Join(scratch, "events.jsonl")
+			t.Cleanup(func() { eventsPath = oldEvents })
+			var decisions []bool
+			var home string
+			fakeCopilot(t, func(ctx context.Context, req copilotRequest) (copilotReply, error) {
+				home = req.Home
+				if _, err := os.Stat(home); err != nil || !strings.HasPrefix(home, scratch) {
+					t.Errorf("private COPILOT_HOME %q: %v", home, err)
+				}
+				if req.Repo != dir || req.Limit != 100 || req.System != rolePrompt(Review) || req.Prompt != "exact prompt" ||
+					strings.Join(req.Tools, ",") != "view,grep,glob,bash" || req.Schema["required"] == nil || req.SessionID == "" {
+					t.Errorf("session request: %+v", req)
+				}
+				for _, cmd := range []string{"git diff --stat", "git push"} {
+					ok, _ := req.Decide("bash", map[string]any{"command": cmd})
+					decisions = append(decisions, ok)
+					req.Event(copilot.SessionEvent{Data: &copilot.ToolExecutionStartData{ToolName: "bash", Arguments: map[string]any{"command": cmd}}})
+				}
+				req.Event(copilot.SessionEvent{Data: &copilot.AssistantTurnStartData{TurnID: "1"}})
+				in, out := int64(1200), int64(30)
+				req.Event(copilot.SessionEvent{Data: &copilot.AssistantUsageData{Model: "actual-model", InputTokens: &in, OutputTokens: &out}})
+				reply := copilotReply{Usage: copilotCredits(.25)}
+				if mode == "timeout" {
+					<-ctx.Done()
+					return reply, ctx.Err()
+				}
+				reply.Content = `{"verdict":"PASS","reasons":["checked"]}`
+				req.Event(copilot.SessionEvent{Data: &copilot.AssistantMessageData{Content: reply.Content}})
+				return reply, nil
+			})
+			c := &Ctx{Repo: dir, Scratch: scratch, Issue: 7}
+			got := agent(c, Review, "exact prompt", new(any))
+			want := map[string]Out{"valid": Ok, "timeout": Timeout}[mode]
+			if got != want || len(decisions) != 2 || !decisions[0] || decisions[1] {
+				t.Fatalf("outcome %v (want %v), decisions %v", got, want, decisions)
+			}
+			if _, err := os.Stat(home); !os.IsNotExist(err) {
+				t.Fatal("private COPILOT_HOME left behind")
+			}
+			if c.Cost != .25 || c.CostUnknown != 0 {
+				t.Fatalf("cost %v unknown %d: a stopped session still reports usage", c.Cost, c.CostUnknown)
+			}
+			b, err := os.ReadFile(filepath.Join(dir, "stats.jsonl"))
+			var st Stats
+			if err != nil || json.Unmarshal(b, &st) != nil {
+				t.Fatalf("stats: %s %v", b, err)
+			}
+			if st.Provider != "copilot" || st.Model != "actual-model" || st.Turns != 1 || st.InputTokens != 1200 ||
+				st.ToolCalls["bash"] != 2 || st.BashCmds["git diff"] != 1 || st.BashCmds["git push"] != 1 ||
+				st.Denials != 1 || st.DeniedTools["bash"] != 1 || len(st.DeniedSample) != 1 || st.Credits == nil || *st.Credits != .25 {
+				t.Fatalf("stats: %s", b)
+			}
+			status, err := os.ReadFile(filepath.Join(scratch, "status.json"))
+			if err != nil || !strings.Contains(string(status), "denied bash") || !strings.Contains(string(status), `"tool_calls": 2`) {
+				t.Fatalf("progress: %s %v", status, err)
+			}
+			entries, err := os.ReadDir(filepath.Join(scratch, "transcripts"))
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("transcripts: %v %v", entries, err)
+			}
+			capture := filepath.Join(scratch, "transcripts", entries[0].Name())
+			request, err := os.ReadFile(filepath.Join(capture, "request.json"))
+			if err != nil || !strings.Contains(string(request), "exact prompt") || !strings.Contains(string(request), `"max_ai_credits": 100`) ||
+				strings.Contains(string(request), "must-not-dump-environment") || strings.Contains(string(request), home) {
+				t.Fatalf("request.json: %s %v", request, err)
+			}
+			stream, err := os.ReadFile(filepath.Join(capture, "stdout.log"))
+			if err != nil || !strings.Contains(string(stream), `"type":"tool.execution_start"`) {
+				t.Fatalf("event stream: %s %v", stream, err)
+			}
+			if result, err := copilotResult(stream); mode == "valid" && (err != nil || string(result) != `{"verdict":"PASS","reasons":["checked"]}`) ||
+				mode == "timeout" && err == nil {
+				t.Fatalf("archived result = %s, %v", result, err)
 			}
 		})
 	}
@@ -1112,6 +1253,7 @@ func TestUnknownUsageStopsRun(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	if os.Getenv("AGENT_SM_TEST_HELPER") == "1" {
+		copilotSession = copilotFixture
 		main()
 		os.Exit(0)
 	}
@@ -1147,35 +1289,9 @@ case "$1 $2" in
   *) exit 1;;
 esac
 `, 0o755)
-	writeFile(t, filepath.Join(dir, "copilot"), `#!/bin/sh
-prompt=""
-usage=""
-session=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -p) shift; prompt="$1";;
-    --usage-output-file) shift; usage="$1";;
-    --session-id) shift; session="$1";;
-  esac
-  shift
-done
-printf '{"totalNanoAiu":100000000,"modelMetrics":{"fixture-model":{}}}' > "$usage"
-if [ -n "$session" ]; then
-  mkdir -p "$COPILOT_HOME/session-state/$session"
-  printf '{"type":"assistant.message","data":{"content":"fixture session"}}\n' > "$COPILOT_HOME/session-state/$session/events.jsonl"
-fi
-case "$prompt" in
-  *"You are the planner"*) echo '{"type":"assistant.message","data":{"content":"{\"status\":\"plan\",\"objective\":\"deliver file\",\"points\":[\"file exists\"],\"points_derived\":false,\"files\":[\"outcome.txt\"],\"verification\":\"default\",\"needs_investigation\":false,\"fits_one_pr\":true,\"units\":[]}"}}';;
-  *"You are the implementation"*) echo delivered > outcome.txt; echo '{"type":"assistant.message","data":{"content":"{\"status\":\"done\",\"summary\":\"delivered file\",\"closes_issue\":true}"}}';;
-  *"You independently review"*) echo '{"type":"assistant.message","data":{"content":"{\"verdict\":\"PASS\",\"reasons\":[\"file verified\"]}"}}';;
-  *) exit 1;;
-esac
-echo '{"type":"result","exitCode":0}'
-`, 0o755)
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	t.Setenv("AGENT_SM_TEST_HELPER", "1")
 	t.Setenv("SM_SCRATCH_ROOT", filepath.Join(dir, "scratch"))
-	t.Setenv("COPILOT_HOME", filepath.Join(dir, "copilot-home"))
 	t.Setenv("SM_TRANSCRIPTS", "false")
 	p := defaultProfile("copilot")
 	p.Base = "main"
@@ -1286,16 +1402,25 @@ func TestChecksPreserveCandidate(t *testing.T) {
 
 func TestCopilotStop(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "copilot"), "#!/bin/sh\nsleep 300\n", 0o755)
-	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	t.Setenv("SM_STATS", filepath.Join(dir, "stats.jsonl"))
+	stopped := make(chan struct{})
+	fakeCopilot(t, func(ctx context.Context, _ copilotRequest) (copilotReply, error) {
+		<-ctx.Done()
+		close(stopped)
+		return copilotReply{}, ctx.Err()
+	})
 	p := defaultProfile("copilot")
-	p.TimeoutMinutes = .001
 	useProfile(t, p)
-	got := agent(&Ctx{Repo: dir, Scratch: dir}, Review, "test", new(any))
-	if got != Timeout {
-		t.Fatalf("got %v", got)
+	old := runCtx
+	ctx, cancel := context.WithCancel(old)
+	runCtx = ctx
+	t.Cleanup(func() { runCtx = old })
+	time.AfterFunc(10*time.Millisecond, cancel)
+	c := &Ctx{Repo: dir, Scratch: dir}
+	if got := agent(c, Review, "test", new(any)); got != Invalid || c.CostUnknown != 1 {
+		t.Fatalf("got %v, unknown usage %d", got, c.CostUnknown)
 	}
+	<-stopped
 }
 
 func TestUsageReportSeparatesProviders(t *testing.T) {

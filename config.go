@@ -248,11 +248,11 @@ func loadProfile(path string) (Profile, error) {
 		enabled, err := strconv.ParseBool(v)
 		p.Audit, p.auditSet = err != nil && v != "" || enabled, true // any other non-empty value keeps meaning on
 	}
-	if p.Provider != "claude" && (os.Getenv("SM_EXTRA_ALLOW") != "" || p.auditSet && p.Audit) {
-		return p, fmt.Errorf("SM_EXTRA_ALLOW and SM_AUDIT are Claude-only")
+	if p.Provider != "claude" && os.Getenv("SM_EXTRA_ALLOW") != "" {
+		return p, fmt.Errorf("SM_EXTRA_ALLOW is Claude-only")
 	}
 	if !p.auditSet {
-		// On by default until runs stop erroring; service mode forbids it, Copilot has no audit.
+		// On by default for Claude until runs stop erroring; service mode forbids Claude audit.
 		p.Audit = p.Provider == "claude" && p.Management.Mode != "service"
 	}
 	return p, p.validateFor(managementCommand)
@@ -290,14 +290,15 @@ func (p Profile) validate() error {
 }
 
 func (p Profile) validateFor(managementOnly bool) error {
-	if p.Management.Mode == "service" && (p.Audit || p.ClaudeExtra != "") {
-		return fmt.Errorf("service management does not allow audit/extra permission bypasses")
+	// Claude audit bypasses its permission checks; Copilot audit is still checked by agent-sm.
+	if p.Management.Mode == "service" && (p.Audit && p.Provider == "claude" || p.ClaudeExtra != "") {
+		return fmt.Errorf("service management does not allow Claude audit/extra permission bypasses")
 	}
 	if p.Provider != "copilot" && p.Provider != "claude" {
 		return fmt.Errorf("provider must be copilot or claude")
 	}
-	if p.Provider != "claude" && (len(p.ClaudeAllow) > 0 || p.ClaudeExtra != "" || p.Audit) {
-		return fmt.Errorf("Claude allow lists and audit mode require provider claude")
+	if p.Provider != "claude" && (len(p.ClaudeAllow) > 0 || p.ClaudeExtra != "") {
+		return fmt.Errorf("Claude allow lists require provider claude")
 	}
 	for state, allow := range p.ClaudeAllow {
 		if !agentState(state) || strings.TrimSpace(allow) == "" {

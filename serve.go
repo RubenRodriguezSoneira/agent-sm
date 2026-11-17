@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"embed"
@@ -289,7 +290,8 @@ func historicalTranscriptResult(scratch, dir, provider string) ([]byte, error) {
 		return nil, fmt.Errorf("transcript exceeds %d bytes", limit)
 	}
 	if provider == "copilot" {
-		return copilotResult(raw)
+		result, err := copilotResult(raw)
+		return dropNulls(result), err
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	var result json.RawMessage
@@ -313,6 +315,64 @@ func historicalTranscriptResult(scratch, dir, provider string) ([]byte, error) {
 	}
 	if len(result) == 0 || !json.Valid(result) {
 		return nil, fmt.Errorf("transcript has no valid final result")
+	}
+	return result, nil
+}
+
+// copilotResult reads the final main-agent answer from a captured Copilot event stream.
+func copilotResult(raw []byte) ([]byte, error) {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	var result []byte
+	completed := false
+	for {
+		var event struct {
+			Type     string          `json:"type"`
+			AgentID  string          `json:"agentId"`
+			Data     json.RawMessage `json:"data"`
+			ExitCode *int            `json:"exitCode"`
+		}
+		if err := d.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("Copilot JSON output: %w", err)
+		}
+		if event.Type == "" || completed {
+			return nil, fmt.Errorf("Copilot JSON output: missing event type or event after final result")
+		}
+		if event.AgentID != "" {
+			continue
+		}
+		switch event.Type {
+		case "assistant.turn_start", "assistant.message_start", "assistant.message_delta":
+			result = nil
+		case "assistant.message":
+			var message struct {
+				Content          *string           `json:"content"`
+				ToolRequests     []json.RawMessage `json:"toolRequests"`
+				ParentToolCallID string            `json:"parentToolCallId"`
+			}
+			if err := json.Unmarshal(event.Data, &message); err != nil {
+				return nil, fmt.Errorf("Copilot assistant message: %w", err)
+			}
+			if message.ParentToolCallID != "" {
+				continue
+			}
+			// Never fall back to an earlier answer if the last main-agent message is incomplete.
+			result = nil
+			if message.Content != nil && len(message.ToolRequests) == 0 {
+				result = []byte(*message.Content)
+			}
+		case "session.error":
+			return nil, fmt.Errorf("Copilot reported a session error: %s", tail(string(event.Data), 1500))
+		case "result":
+			if event.ExitCode == nil || *event.ExitCode != 0 {
+				return nil, fmt.Errorf("Copilot JSON output: missing or unsuccessful final exitCode")
+			}
+			completed = true
+		}
+	}
+	if !completed || len(bytes.TrimSpace(result)) == 0 {
+		return nil, fmt.Errorf("Copilot JSON output: missing final result or complete assistant response")
 	}
 	return result, nil
 }

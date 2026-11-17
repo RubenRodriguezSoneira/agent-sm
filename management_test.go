@@ -686,7 +686,7 @@ func TestManagementProfileAndCredentialIsolation(t *testing.T) {
 	if strings.Contains(configuredAllow(Plan), "gh issue") {
 		t.Fatal("worker tracker access retained")
 	}
-	if !strings.Contains(strings.Join(copilotArgs(Plan, "", "usage", 1), " "), "--deny-tool=shell(rtk proxy gh:*)") {
+	if ok, _ := shellDecision(Plan, "rtk proxy gh issue list"); ok {
 		t.Fatal("RTK tracker bypass")
 	}
 }

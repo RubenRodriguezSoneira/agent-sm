@@ -2,7 +2,7 @@
 
 A state machine that takes one GitHub issue to a reviewed branch. The program owns the loop:
 each step returns a typed outcome, one table (`next()` in `main.go`) decides the transition, and
-agents (`copilot -p` by default, or `claude -p`) only run inside single steps. Every step is declared once in the `steps`
+agents (Copilot through its Go SDK by default, or `claude -p`) only run inside single steps. Every step is declared once in the `steps`
 table in `main.go`: its function, outcomes, role prompt, output schema, allow list and model.
 
     prepare -> plan -> investigate (one session per unit) -> execute -> check -> review -> publish
@@ -42,7 +42,7 @@ refuses to overwrite a remote branch that appeared after the name was selected.
 
 The repo's working tree must be clean; the run creates an available `sm/issue-<n>` branch. It needs
 `copilot` (or `claude`), `git` and `gh` on the PATH, authenticated independently of the desktop
-app, plus the target project's build/test tools. Checks must be configured; there is no
+app (the Copilot CLI must speak SDK protocol 3; 1.0.108–1.0.112 are known to work), plus the target project's build/test tools. Checks must be configured; there is no
 implicit Cargo default. `stats` and `allow` do not require a project profile.
 
 With no arguments or config, `go run .` starts the web UI in the current Git repo. It detects Go
@@ -78,7 +78,7 @@ in place; delete it before running the issue again.
 | `SM_EXTRA_ALLOW` | none | Claude-only allow entries added to every agent step. |
 | `SM_ADD_DIRS` | none | Comma-separated directories agents may read outside the repo. |
 | `SM_NOTES_DIR` | none | Operator notes added to dispatches: `all.md`, or `<role>.md` for one step. |
-| `SM_AUDIT` | on for Claude (off in service mode and for Copilot) | Claude only: load every tool and bypass permissions (outward commands stay denied) to measure tool use. On by default while runs still error; `SM_AUDIT=0` or `"audit": false` turns it off. Not a sandbox. |
+| `SM_AUDIT` | on for Claude (off in service mode and for Copilot) | Measure tool use beyond the allow list. Claude: load every tool and bypass permissions (outward commands stay denied); rejected in service mode. Copilot: agent-sm's policy also allows unlisted shell commands and reads outside the repo, still denying outward/tracker commands, recursive `rm`, shell wrappers and edits outside the step's roots; allowed in service mode. `SM_AUDIT=0` or `"audit": false` turns it off. Not a sandbox. |
 | `SM_TRANSCRIPTS` | `true` | Local transcript saving for either provider (`true`/`false` or `1`/`0`), on by default while runs still error. A capture failure is logged and never fails the step. Independent of permission audit. |
 | `SM_GHIDRA_COPY` | `none` | Legacy-profile-only Ghidra project copy. |
 | `SM_EXPORT` | `~/rescue-re/export` | Legacy-profile-only export; generic runs do not inspect it. |
@@ -135,16 +135,20 @@ role notes for portable guidance. Copilot also loads its normal repository instr
 Do not pass app configuration as an agent-sm profile: `.github/github-app.yml` remains owned
 by the Copilot app. Old rescue-specific prompts are selected only by `legacy_rust_ghidra`.
 
-Copilot uses `--output-format=json` JSONL events, strict local JSON validation, and
-`--usage-output-file` for native credits. The last complete main-agent response is decoded
-without Markdown rendering or line wrapping, and requires a successful terminal `result`
-event. Tool/sub-agent messages and partial deltas cannot substitute for that response;
-prose, code fences, malformed JSON and off-schema content are still rejected, not repaired.
-Its live feed currently shows start/end, not tool calls; unavailable model/tool/turn/usage
-data is marked unknown. Claude retains its stream
+Copilot runs through the Copilot Go SDK, which drives the installed CLI over JSON-RPC with a
+private per-session `COPILOT_HOME`. The step schema is sent as a native response format (in
+strict form: optional fields travel as `null` and are dropped before validation), the step's
+role is the system message, and credits come from the session's usage metrics, enforced
+in-session as an AI-credit limit. Every tool call passes agent-sm's own pre-tool hook
+(`copilot_policy.go`): file tools are confined to the repo and `add_dirs` (edits only in
+execute, through symlinks too), shell commands must match the step's allow list segment by
+segment, and command substitution, writes by redirection, background jobs and variable
+assignments are refused. The live feed and stats show Copilot turns, tools, shell commands,
+tokens, model and denials. Strict local JSON validation still applies: prose, code fences,
+malformed JSON and off-schema content are rejected, not repaired. Claude retains its stream
 feed. Both reject missing, duplicate, malformed, or off-schema result fields and failed
-subprocesses. Stats separate providers and units; old Claude stats remain readable.
-`allow` emits Claude syntax only; it does not infer a Copilot policy from absent telemetry.
+sessions. Stats separate providers and units; old stats remain readable.
+`allow` emits Claude syntax only; Copilot denials are reported by `stats`.
 
 Worker MCP servers, delegation, and broad permission bypasses are not enabled for Copilot:
 its visible tools are explicitly restricted to file/search/shell tools. Add trusted command
@@ -222,7 +226,8 @@ values in your project, not from this example. No Jira labels are added.
 
 Service GitHub tokens (`GH_TOKEN`, `GITHUB_TOKEN` and Enterprise variants) and Jira credentials
 are removed from agent/check environments. Agent tool policies also deny tracker commands,
-including RTK forms; audit/extra-permission bypasses are rejected in service mode. These are
+including RTK forms; Claude audit/extra-permission bypasses are rejected in service mode
+(Copilot audit keeps the tracker denials). These are
 not an OS/network sandbox: use separate least-privilege agent authentication and do not expose
 service credentials in files the workers can read.
 
@@ -344,12 +349,11 @@ the complete history; large installations should compact/split this state before
 - `<scratch>/status.json`: the running session's live state. `<scratch>/run.log`: output of a run started from the page.
 - `<scratch>/failures.jsonl`: page-started runs that failed before the agent started (issue read, `Base branch` metadata, base fetch, worktree), one JSON line each.
 - Transcripts are on by default. To turn them off, untick **Save transcripts** before Run, set `"transcripts": false` in a profile, or use `SM_TRANSCRIPTS=0`. Each agent call/retry gets a separate private directory at `<scratch>/transcripts/<provider>-<step>-<unique>/`; its path is recorded in `events.jsonl`.
-  - `request.json`: exact CLI arguments (including prompts), working directory, schema and start time; no environment dump.
-  - `stdout.log` / `stderr.log`: raw CLI streams captured before JSON validation, including malformed output. Claude's stdout includes its message/tool stream and native usage.
-  - Copilot also retains `usage.json` and copies its native session events to `messages.jsonl` after the subprocess exits. This requires CLI support for `--session-id`, `--no-remote-export` and the documented local session-state layout. Session export to GitHub is disabled for these captured Copilot calls; no gist/share upload is requested.
+  - `request.json`: exact CLI arguments (Claude) or SDK session request (Copilot), including prompts, working directory, schema and start time; no environment dump.
+  - `stdout.log` / `stderr.log`: raw streams captured before JSON validation, including malformed output. Claude's stdout includes its message/tool stream and native usage. Copilot's stdout holds the SDK session events as JSONL (messages, tool calls with arguments and results, hook decisions, usage), ending in a `result` record; `model.*` debug events and encrypted reasoning are omitted.
   - `result.json`: agent-call outcome, finish time and any capture error. A logging failure prevents successful workflow continuation, even if the provider itself returned a valid result; provider usage statistics still describe that provider call.
-  - Captures contain only messages exposed by the CLI, not hidden model reasoning. Cancellation, output limits, startup failure or disk errors can leave partial captures; a missing native session log is recorded explicitly. Transcripts are not reconstructed for past runs.
-  - Transcripts can contain source code, secrets or sensitive tool output. Directories are private (`0700`), app-created files use `0600`, and nothing expires automatically. Review/delete them when no longer needed; Copilot also retains its original local session history separately. This does **not** enable Claude's permission-bypassing **permission audit**.
+  - Captures contain only messages exposed by the CLI, not hidden model reasoning. Cancellation, output limits, startup failure or disk errors can leave partial captures. Transcripts are not reconstructed for past runs.
+  - Transcripts can contain source code, secrets or sensitive tool output. Directories are private (`0700`), app-created files use `0600`, and nothing expires automatically. Review/delete them when no longer needed; Copilot's private session home is deleted after each step. This does **not** enable Claude's permission-bypassing **permission audit**.
 - `agent-sm-stats.jsonl` (`SM_STATS`): one line per agent session, including the agent's explanation (up to 4,000 characters). It is local output and is gitignored.
 - `agent-sm stats [file]` summarizes usage and models by provider/state. The web UI follows the latest run; queue history is in memory and resets on restart, but saved run files remain available. There is no older-run picker yet.
 - `runs/`: archived attempts kept in the repo as evidence for the issues that cite them. Nothing writes there.
