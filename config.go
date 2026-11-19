@@ -34,6 +34,7 @@ type Profile struct {
 	ClaudeExtra    string              `json:"claude_extra_allow,omitempty"`
 	Audit          bool                `json:"audit,omitempty"`
 	Transcripts    bool                `json:"transcripts"`
+	Concurrency    int                 `json:"concurrency,omitempty"` // queued issues `serve` runs at once; 0 or 1 is one at a time
 	auditSet       bool                // audit was chosen by the profile or SM_AUDIT, not defaulted
 }
 
@@ -41,6 +42,7 @@ var settings = defaultProfile("copilot")
 var managementCommand bool
 
 const minCopilotCredits = 100
+const maxConcurrency = 16
 
 func finiteNonnegative(n float64) bool {
 	return !math.IsNaN(n) && !math.IsInf(n, 0) && n >= 0
@@ -105,6 +107,13 @@ func decodeProfile(b []byte, provider string) (Profile, error) {
 }
 
 func (p *Profile) applyLimitEnv() error {
+	if v, ok := os.LookupEnv("SM_CONCURRENCY"); ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("SM_CONCURRENCY must be an integer")
+		}
+		p.Concurrency = n
+	}
 	for _, entry := range []struct {
 		name string
 		dst  *float64
@@ -308,6 +317,9 @@ func (p Profile) validateFor(managementOnly bool) error {
 		if !finiteNonnegative(n) {
 			return fmt.Errorf("limits and timeout must be finite and nonnegative")
 		}
+	}
+	if p.Concurrency < 0 || p.Concurrency > maxConcurrency {
+		return fmt.Errorf("concurrency must be between 0 and %d", maxConcurrency)
 	}
 	if p.SessionLimit == 0 || p.TimeoutMinutes == 0 {
 		return fmt.Errorf("session_limit and timeout_minutes must be positive")

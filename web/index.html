@@ -205,6 +205,7 @@
       <span id="provider"></span>
       <label>Limit per step <span id="budgetUnit"></span> <input class="field" type="number" id="budget" value="2" min="0.01" step="0.01" required></label>
       <span class="mute" id="runBudget"></span>
+      <label title="How many queued issues run at once, each in its own worktree. Applies to every queue on this server.">In parallel <input class="field" type="number" id="parallel" value="1" min="1" max="16" step="1" style="width:4.5em"></label>
       <label title="Save prompts, responses and available tool messages locally. May contain sensitive code or output."><input type="checkbox" id="transcripts"> Save transcripts</label>
       <label title="Claude only: bypass permission approvals to measure tool use. Not transcript logging."><input type="checkbox" id="audit"> permission audit</label>
       <button class="btn danger" id="stopBtn" disabled>Stop</button>
@@ -373,8 +374,9 @@ function renderIssues() {
   const state = {}; // issue -> what the queue says about it
   (QUEUE.history || []).forEach(j => state[j.issue] = [j.exit || "failed", exitCls(j.exit)]);
   (QUEUE.queued || []).forEach(j => state[j.issue] = ["queued", "warn"]);
-  if (QUEUE.running) state[QUEUE.running.issue] = ["running", "run"];
-  const left = new Set((QUEUE.leftover || []).filter(n => !(QUEUE.running && QUEUE.running.issue === n)));
+  const running = new Set((QUEUE.running || []).map(j => j.issue));
+  running.forEach(n => state[n] = ["running", "run"]);
+  const left = new Set((QUEUE.leftover || []).filter(n => !running.has(n)));
   $("issueCount").textContent = rows.length + (rows.length === ISSUES.length ? "" : " of " + ISSUES.length);
   put("issueGrid", rows.map(i => {
     const s = state[i.number], busy = s && (s[0] === "running" || s[0] === "queued");
@@ -421,7 +423,7 @@ $("models").addEventListener("change", () => { try { localStorage.setItem("sm-mo
 function renderQueue(q) {
   const first = !QUEUE.provider;
   const providerChanged = QUEUE.provider && QUEUE.provider !== q.provider;
-  QUEUE = q; BUSY = !!q.running; renderModels(q.models);
+  QUEUE = q; BUSY = !!(q.running || []).length; renderModels(q.models);
   $("provider").textContent = q.provider || "";
   $("budgetUnit").textContent = q.usage_unit || "";
   $("budget").min = q.min_session_limit;
@@ -430,17 +432,18 @@ function renderQueue(q) {
   $("runBudget").textContent = "Run limit: " + (q.run_limit ? q.run_limit + " " + q.usage_unit : "unlimited");
   if (first || providerChanged) $("budget").value = q.session_limit;
   if (first) $("transcripts").checked = !!q.transcripts;
+  if (first) $("parallel").value = q.concurrency || 1;
   if (first || providerChanged) $("audit").checked = !!q.audit;
   $("audit").disabled = q.provider !== "claude";
   if ($("audit").disabled) $("audit").checked = false;
   const chips = [];
-  if (q.running) chips.push(`<span class="chip run" title="${esc(q.running.branch || "")}">running #${q.running.issue}</span>`);
+  (q.running || []).forEach(j => chips.push(`<span class="chip run" title="${esc(j.branch || "")}">running #${j.issue}</span>`));
   (q.queued || []).forEach(j => chips.push(`<span class="chip warn">queued #${j.issue}</span>`));
   (q.history || []).slice(-6).reverse().forEach(j => chips.push(`<span class="chip ${exitCls(j.exit)}" title="${esc([j.branch, j.err].filter(Boolean).join(" · "))}">#${j.issue} ${esc(j.exit || "failed")}</span>`));
   put("qstate", chips.length ? '<span class="mute">Queue</span>' + chips.join("") : "");
   // The last finished job's failure, until the same issue is running again.
   const last = (q.history || []).slice(-1)[0];
-  if (last && last.err && !(q.running && q.running.issue === last.issue)) $("msg").textContent = QERR = "#" + last.issue + ": " + last.err;
+  if (last && last.err && !(q.running || []).some(j => j.issue === last.issue)) $("msg").textContent = QERR = "#" + last.issue + ": " + last.err;
   else if ($("msg").textContent === QERR) $("msg").textContent = "";
   $("stopBtn").disabled = !BUSY && !(q.queued || []).length;
   renderIssues();
@@ -540,7 +543,7 @@ $("runBtn").addEventListener("click", async () => {
   $("msg").textContent = $("note").textContent = "";
   try {
     SEL.clear(); PICKED = null;
-    const body = { issues, repo: SELECTED_REPO, language: SELECTED_LANGUAGE, publish, provider: SELECTED_AGENT, audit: $("audit").checked, transcripts: $("transcripts").checked, budget: $("budget").value, models: chosenModels() };
+    const body = { issues, repo: SELECTED_REPO, language: SELECTED_LANGUAGE, publish, provider: SELECTED_AGENT, audit: $("audit").checked, transcripts: $("transcripts").checked, budget: $("budget").value, concurrency: Math.min(16, Math.max(1, parseInt($("parallel").value, 10) || 1)), models: chosenModels() };
     const q = await post("/api/run", body);
     renderQueue(q); $("note").textContent = (q.notes || []).join(" · "); tick();
     if ($("note").textContent) loadIssues(true); // a note can mean an issue was closed
@@ -548,7 +551,7 @@ $("runBtn").addEventListener("click", async () => {
   catch (e) { $("msg").textContent = "Cannot start: " + e.message; }
 });
 $("stopBtn").addEventListener("click", async () => {
-  if (!confirm("Stop the running job and clear the queue?")) return;
+  if (!confirm("Stop the running jobs and clear the queue?")) return;
   try { renderQueue(await post(selectionURL("/api/stop"))); } catch (e) { $("msg").textContent = "Cannot stop: " + e.message; }
 });
 
