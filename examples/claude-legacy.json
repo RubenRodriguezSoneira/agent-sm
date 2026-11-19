@@ -4,7 +4,11 @@
   "format": "cargo fmt --all",
   "checks": [
     "cargo fmt --all -- --check",
-    "cargo clippy --workspace --all-targets -- -D warnings",
-    "cargo test --workspace"
+    "scripts/check-deps.sh",
+    "scripts/check-determinism.sh",
+    "cargo clippy --locked --workspace --all-targets -- -D warnings",
+    "cargo test --locked --workspace",
+    "cargo test --locked --workspace --doc",
+    "scripts/check-diff.sh . --staged"
   ]
 }
