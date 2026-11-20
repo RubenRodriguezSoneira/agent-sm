@@ -3,8 +3,8 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -153,10 +153,8 @@ func TestUnitLoop(t *testing.T) {
 func TestResume(t *testing.T) {
 	old := steps
 	defer func() { steps = old }()
-	steps = map[State]func(*Ctx) Out{
-		Review:  func(c *Ctx) Out { c.Verdict = "fine"; return Pass },
-		Publish: func(*Ctx) Out { return Ok },
-	}
+	steps[Review].Run = func(c *Ctx) Out { c.Verdict = "fine"; return Pass }
+	steps[Publish].Run = func(*Ctx) Out { return Ok }
 	dir := t.TempDir()
 	saveCtx(&Ctx{Issue: 7, Scratch: dir, Repo: "old", Evidence: "kept"})
 
@@ -211,4 +209,57 @@ func TestReadRun(t *testing.T) {
 	if live := liveState([]runStep{{"plan", "ok"}, {"investigate", "more"}}); live != "investigate" {
 		t.Errorf("liveState after more = %q", live)
 	}
+}
+
+func fake(t *testing.T, runs map[State]func(*Ctx) Out) {
+	old := steps
+	t.Cleanup(func() { steps = old })
+	for i := range steps {
+		o := steps[i].Outs[0] // Ok or Pass: the forward edge
+		steps[i].Run = func(*Ctx) Out { return o }
+	}
+	for s, f := range runs {
+		steps[s].Run = f
+	}
+}
+
+func testGit(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	out, err := sh(repo, "git", args...)
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return strings.TrimSpace(out)
+}
+
+func retryRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	testGit(t, dir, "init", "-q", "-b", "main", repo)
+	testGit(t, repo, "config", "user.name", "test")
+	testGit(t, repo, "config", "user.email", "test@example.com")
+	testGit(t, repo, "commit", "-q", "--allow-empty", "-m", "base")
+	remote := filepath.Join(dir, "remote.git")
+	testGit(t, dir, "init", "-q", "--bare", remote)
+	testGit(t, repo, "remote", "add", "origin", remote)
+	testGit(t, repo, "push", "-q", "origin", "main")
+	writeFile(t, filepath.Join(dir, "gh"), `#!/bin/sh
+if [ -n "$SM_TEST_GH_ARGS" ]; then printf '%s\n' "$@" >> "$SM_TEST_GH_ARGS"; fi
+case "$1 $2" in
+  "pr list")
+    if [ "$SM_TEST_PR_ERROR" = 1 ]; then echo 'PR lookup failed' >&2; exit 1; fi
+    if [ -n "$SM_TEST_PR_RESPONSE" ]; then printf '%s\n' "$SM_TEST_PR_RESPONSE"; exit; fi
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--head" ]; then shift; head="$1"; fi
+      shift
+    done
+    if [ "$head" = "$SM_TEST_PR_BRANCH" ]; then echo '[{"number":42}]'; else echo '[]'; fi;;
+  "pr create") echo 'https://github.com/example/repo/pull/42';;
+  "pr comment") :;;
+  *) exit 1;;
+esac
+`, 0o755)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return repo
 }

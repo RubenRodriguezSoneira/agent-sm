@@ -1021,6 +1021,15 @@ func contains(l []Out, o Out) bool {
 	return false
 }
 
+// stateNames lists every station name in state order.
+func stateNames() []string {
+	names := make([]string, numStates)
+	for s := State(0); s < numStates; s++ {
+		names[s] = s.String()
+	}
+	return names
+}
+
 // saveCtx writes the run's data after every step, so a later run can pick it up with --from
 // (and an operator can correct it by hand first).
 func saveCtx(c *Ctx) {
@@ -1051,7 +1060,7 @@ func resume(c *Ctx, from string) (State, error) {
 			return s, nil
 		}
 	}
-	return 0, fmt.Errorf("--from must be one of: %s", strings.Join(stateNames[Plan:], ", "))
+	return 0, fmt.Errorf("--from must be one of: %s", strings.Join(stateNames()[Plan:], ", "))
 }
 
 func run(c *Ctx, s State) Exit {
@@ -1067,9 +1076,9 @@ func run(c *Ctx, s State) Exit {
 		}
 		visits[s]++
 		c.Rounds = visits[Execute]
-		o := steps[s](c)
+		o := steps[s].Run(c)
 		saveCtx(c)
-		if !contains(outs[s], o) {
+		if !contains(steps[s].Outs, o) {
 			panic(fmt.Sprintf("step %v returned undeclared out %v", s, o))
 		}
 		logEvent(map[string]any{"state": s.String(), "out": o.String(), "visit": visits[s],

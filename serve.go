@@ -428,7 +428,7 @@ func serve(issue, addr, repo string) error {
 				}
 			}
 		}
-		json.NewEncoder(w).Encode(map[string]any{"runs": runs, "stations": stateNames, "limits": map[string]int{"execute": maxExecute}})
+		json.NewEncoder(w).Encode(map[string]any{"runs": runs, "stations": stateNames(), "limits": map[string]int{"execute": maxExecute}})
 	})
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		scratch, iss := os.Getenv("SM_SCRATCH"), issue
