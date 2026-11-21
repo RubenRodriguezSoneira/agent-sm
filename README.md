@@ -10,6 +10,12 @@ table in `main.go`: its function, outcomes, role prompt, output schema, allow li
 Exits: `ready`, `gave-up`, `errored`, `split`, `escalated`, `stopped`. A blocked execute goes back to plan once
 (usually to widen the file list), with the executor's report; blocked again, the run gives up.
 
+`prepare` runs the checks on the untouched base first. If they already fail, the run stops as `errored`
+before any agent starts, since no fix round of an issue that may not touch that code could pass. With a
+publish level (not in service mode), it also files one `bug` issue titled `Base <base> check failed: <command>`
+(or comments on the open one with that title) and links the blocked issue to it. That bug's body contains
+`agent-sm: fixes-base`, which skips the base check; add the line to any issue meant to repair the base.
+
 ## Usage
 
     go run .                                    # auto-configure and start the web UI
@@ -86,7 +92,7 @@ in place; delete it before running the issue again.
 | `SM_EXPORT` | `~/rescue-re/export` | Legacy-profile-only export; generic runs do not inspect it. |
 | `SM_EPIC` | none | Epic that a follow-up issue joins (split, or three failed fix rounds). |
 | `SM_LINKS` | none | Comma-separated gitignored files to symlink into a worktree (serve). |
-| `SM_STATS` | `agent-sm-stats.jsonl` | Where session stats are appended. |
+| `SM_STATS` | `$SM_SCRATCH_ROOT/stats.jsonl` | Where session stats are appended. |
 | `SM_SCRATCH_ROOT`, `SM_SCRATCH`, `SM_EVENTS` | `~/.local/state/agent-sm` (or `$XDG_STATE_HOME/agent-sm`), `<root>/<issue>`, `<scratch>/events.jsonl` | Where run data goes. |
 
 A session that hits `SM_TIMEOUT` returns `timeout`; an observed native limit exhaustion
@@ -355,7 +361,7 @@ the complete history; large installations should compact/split this state before
   - `result.json`: agent-call outcome, finish time and any capture error. A logging failure prevents successful workflow continuation, even if the provider itself returned a valid result; provider usage statistics still describe that provider call.
   - Captures contain only messages exposed by the CLI, not hidden model reasoning. Cancellation, output limits, startup failure or disk errors can leave partial captures; a missing native session log is recorded explicitly. Transcripts are not reconstructed for past runs.
   - Transcripts can contain source code, secrets or sensitive tool output. Directories are private (`0700`), app-created files use `0600`, and nothing expires automatically. Review/delete them when no longer needed; Copilot also retains its original local session history separately. This does **not** enable Claude's permission-bypassing **permission audit**.
-- `agent-sm-stats.jsonl` (`SM_STATS`): one line per agent session. It is local output and is gitignored.
+- `stats.jsonl` under the run history (`SM_STATS`): one line per agent session, with its time (`t`) and repository (`repo`), shared by every working directory.
 - `agent-sm stats [file]` summarizes usage and models by provider/state. The web UI follows the latest run; queue history is in memory and resets on restart, but saved run files remain available. There is no older-run picker yet.
 - `runs/`: archived attempts kept in the repo as evidence for the issues that cite them. Nothing writes there.
 
