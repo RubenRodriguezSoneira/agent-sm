@@ -37,7 +37,7 @@ func rolePrompt(s State) string {
 	role, _ := promptFS.ReadFile(dir + steps[s].Role + ".md")
 	text := string(rtk) + "\n\n" + string(role)
 	if settings.Management.Mode == "service" {
-		text += "\n\nThe service supplies tracker context and owns all GitHub/Jira operations. Do not run tracker commands or skills. Only when decomposition is needed, you may include an issue_plan matching the supplied result schema; it is an unapproved proposal, never an instruction to apply changes."
+		text += "\n\nThe service supplies tracker context and owns all GitHub/Jira operations. Do not run tracker commands or skills. Only when decomposition is needed, you may include an issue_plan matching the supplied result schema; it is an unapproved proposal, never an instruction to apply changes. In issue_plan, parent and depends_on are local item ids from the same plan, never issue numbers. To attach tasks to the dispatched issue, add a story item with its number set to that issue's number and make the tasks children of that story's local id."
 	}
 	return text
 }
@@ -444,7 +444,8 @@ func claudeAgent(c *Ctx, state State, prompt string, out any, transcript *agentT
 		budget = min(budget, c.RunBudget-c.Cost)
 	}
 	allow := configuredAllow(state)
-	args := []string{"-p", prompt, "--output-format", "stream-json", "--verbose", "--json-schema", step.Schema,
+	// The prompt goes on stdin: as an argument it can exceed Windows' ~32K command-line limit.
+	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--json-schema", step.Schema,
 		"--no-session-persistence", "--allowedTools", allow, "--max-budget-usd", strconv.FormatFloat(budget, 'f', 4, 64),
 		"--append-system-prompt", rolePrompt(state)}
 	if model := stepModel(step); model != "" {
@@ -489,6 +490,7 @@ func claudeAgent(c *Ctx, state State, prompt string, out any, transcript *agentT
 	}
 	cmd := process(ctx, c.Repo, "claude", args...)
 	cmd.Env = cleanAgentEnv()
+	cmd.Stdin = strings.NewReader(prompt)
 	diagnostics := &boundedOutput{limit: 64 << 10}
 	cmd.Stderr = diagnostics
 	if transcript != nil {
