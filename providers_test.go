@@ -243,8 +243,19 @@ func TestQueuedLanguageProfile(t *testing.T) {
 	}
 }
 
+// realTempDir is t.TempDir() as Git reports it: macOS's /var is a symlink to /private/var,
+// and Windows' temp path can hold 8.3 short names (RUNNER~1).
+func realTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestCanonicalRepo(t *testing.T) {
-	dir := t.TempDir()
+	dir := realTempDir(t)
 	repo := filepath.Join(dir, "repo")
 	if err := os.Mkdir(repo, 0o755); err != nil {
 		t.Fatal(err)
@@ -275,7 +286,7 @@ func TestRunScratchSeparatesRepositories(t *testing.T) {
 }
 
 func TestFolderBrowser(t *testing.T) {
-	root := t.TempDir()
+	root := realTempDir(t)
 	t.Setenv("HOME", root)
 	t.Setenv("USERPROFILE", root)
 	repo, plain, linked := filepath.Join(root, "repo"), filepath.Join(root, "plain folder"), filepath.Join(root, "linked")
@@ -651,7 +662,7 @@ else
 fi
 if [ "$FIXTURE_MODE" = "failure" ]; then exit 1; fi
 `, 0o755)
-				t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+				t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 				t.Setenv("SM_STATS", filepath.Join(dir, "stats.jsonl"))
 				t.Setenv("PROVIDER", provider)
 				t.Setenv("FIXTURE_MODE", mode)
@@ -804,7 +815,7 @@ if [ "$SM_TEST_MODE" = "failure" ]; then exit 1; fi
 				if mode == "startup" {
 					writeFile(t, filepath.Join(dir, provider), "#!/agent-sm-missing-interpreter\n", 0o755)
 				}
-				t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+				t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 				t.Setenv("COPILOT_HOME", filepath.Join(dir, "copilot-home"))
 				t.Setenv("SM_STATS", filepath.Join(dir, "stats.jsonl"))
 				t.Setenv("SM_TEST_MODE", mode)
@@ -948,7 +959,7 @@ func TestTranscriptIOFailure(t *testing.T) {
 	// Capture is diagnostics: when it cannot be opened the step still runs, and the failure is logged.
 	marker := filepath.Join(dir, "started")
 	writeFile(t, filepath.Join(dir, "claude"), "#!/bin/sh\ntouch '"+marker+"'\n", 0o755)
-	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	agent(&Ctx{Repo: dir, Scratch: dir}, Review, "test", new(any))
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatal("capture failure stopped the step from running")
@@ -1105,7 +1116,7 @@ case "$1 $2" in
   *) exit 1;;
 esac
 `, 0o755)
-	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("SM_SCRATCH_ROOT", filepath.Join(dir, "scratch"))
 	p := defaultProfile("claude")
 	p.Base = "main"
@@ -1227,7 +1238,7 @@ case "$prompt" in
 esac
 echo '{"type":"result","exitCode":0}'
 `, 0o755)
-	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AGENT_SM_TEST_HELPER", "1")
 	t.Setenv("SM_SCRATCH_ROOT", filepath.Join(dir, "scratch"))
 	t.Setenv("COPILOT_HOME", filepath.Join(dir, "copilot-home"))
@@ -1345,7 +1356,7 @@ func TestChecksPreserveCandidate(t *testing.T) {
 func TestCopilotStop(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "copilot"), "#!/bin/sh\nsleep 300\n", 0o755)
-	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("SM_STATS", filepath.Join(dir, "stats.jsonl"))
 	p := defaultProfile("copilot")
 	p.TimeoutMinutes = .001
@@ -1388,7 +1399,7 @@ case "$1 $2" in
   *) exit 1;;
 esac
 `, 0o755)
-	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	for _, tc := range []struct{ state, prs, branch, want string }{
 		{"OPEN", `[]`, "", ""},
 		{"CLOSED", `[]`, "sm/issue-5-2", "issue #5 is closed"},
@@ -1425,7 +1436,11 @@ func TestWorktreeLinks(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(dir, "missing.bin")); err == nil {
 		t.Fatal("linked a file the main checkout does not have")
 	}
-	for _, bad := range []string{"../x", "/etc/passwd", "."} {
+	bad := []string{"../x", "/etc/passwd", ".", "a/../../x"}
+	if runtime.GOOS == "windows" { // names that only leave the repo on Windows
+		bad = append(bad, `\\server\share\x`, `C:\x`, `C:x`, `..\x`)
+	}
+	for _, bad := range bad {
 		p := defaultProfile("claude")
 		p.Checks, p.Links = []string{"true"}, []string{bad}
 		if p.validate() == nil {
