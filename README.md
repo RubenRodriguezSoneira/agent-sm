@@ -164,6 +164,8 @@ sandbox (`sandbox.go`). Every step gets `read,grep,find,ls,bash`; steps that edi
   (or `"cargo rust"`, `dotnet9-sdk`). The worktree is mounted at `/work`, pi's `auth.json` read-only.
   Also read-only: `links` at their place under `/work`, and `add_dirs` under the container's home
   (`/root`) when they are under yours, so `~/x` stays `~/x`, otherwise under `/host` (`C:\x` is `/host/C/x`).
+  Repos that run DeSmuME probes build `sandbox/desmume.Containerfile` instead (py-desmume plus the ROM
+  dump at `/rom/pmdb.nds`; see its header).
 
 Neither sandbox has `GH_TOKEN`, an SSH agent or the `gh` login, so only agent-sm can push, open PRs
 or edit issues. The network stays open: pi needs the model provider. The role prompt goes in
